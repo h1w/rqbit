@@ -38,6 +38,8 @@ use crate::{
         ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions, ManagedTorrentState,
         TorrentMetadata, TorrentStateLive, initializing::TorrentStateInitializing,
     },
+    tunnel::options::TunnelOptions,
+    tunnel::service::TunnelService,
     type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite, PeerStream},
 };
 use anyhow::{Context, bail};
@@ -124,6 +126,12 @@ pub struct Session {
     // Lifecycle management
     cancellation_token: CancellationToken,
     _cancellation_token_drop_guard: DropGuard,
+
+    /// Optional tunnel service (client or server).  Set during session
+    /// construction if SessionOptions::tunnel is Some.  Stored behind an
+    /// ArcSwapOption so it can be populated after the Arc&lt;Session&gt; is
+    /// already constructed.
+    tunnel_service: ArcSwapOption<TunnelService>,
 
     // Runtime settings
     output_folder: PathBuf,
@@ -479,6 +487,11 @@ pub struct SessionOptions {
     /// Override the client name and version used in User-Agent headers and
     /// peer extended handshakes. Defaults to "rqbit X.Y.Z".
     pub client_name_and_version: Option<String>,
+
+    /// Tunnel configuration.  Set to `None` (default) to disable tunnel mode.
+    /// When `Some`, the chosen role (client or server) is validated and
+    /// started during session construction.
+    pub tunnel: Option<TunnelOptions>,
 }
 
 impl Default for SessionOptions {
@@ -507,6 +520,7 @@ impl Default for SessionOptions {
             disable_local_service_discovery: false,
             ipv4_only: false,
             client_name_and_version: None,
+            tunnel: None,
         }
     }
 }
@@ -557,6 +571,12 @@ impl Session {
 
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
+    }
+
+    /// Returns the tunnel service if one was configured and started during
+    /// session construction.
+    pub fn tunnel_service(&self) -> Option<Arc<TunnelService>> {
+        self.tunnel_service.load_full()
     }
 
     pub fn client_name_and_version(&self) -> &str {
@@ -810,6 +830,7 @@ impl Session {
                 #[cfg(feature = "disable-upload")]
                 _disable_upload: opts.disable_upload,
                 blocklist,
+                tunnel_service: ArcSwapOption::empty(),
                 allowlist,
                 lsd,
             });
@@ -856,6 +877,13 @@ impl Session {
                         Self::task_upnp_port_forwarder(announce_port, bind_device),
                     );
                 }
+            }
+
+            // Start tunnel service if configured.
+            if let Some(tunnel_opts) = opts.tunnel.take() {
+                tunnel_opts.validate()?;
+                let svc = TunnelService::start(&session, tunnel_opts).await?;
+                session.tunnel_service.store(Some(svc));
             }
 
             if let Some(persistence) = session.persistence.as_ref() {
