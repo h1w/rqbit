@@ -140,12 +140,12 @@ pub fn initiator_complete(
 ///
 /// Processes the initiator's first message, inspects the remote static public
 /// key, rejects if absent from `allowed_clients`, and returns a ready-to-use
-/// `NoiseTransport` together with the reply bytes to send back.
+/// `NoiseTransport`, the remote public key, and the reply bytes to send back.
 pub fn responder_accept(
     local_key: &TunnelPrivateKey,
     msg: &[u8],
     allowed_clients: &HashSet<TunnelPublicKey>,
-) -> Result<(NoiseTransport, Vec<u8>), TunnelCryptoError> {
+) -> Result<(NoiseTransport, TunnelPublicKey, Vec<u8>), TunnelCryptoError> {
     let params = noise_params();
 
     let builder = snow::Builder::new(params).local_private_key(&local_key.0);
@@ -191,6 +191,7 @@ pub fn responder_accept(
             recv_seq: 0,
             send_seq: 0,
         },
+        remote_pub,
         msg_buf[..len].to_vec(),
     ))
 }
@@ -300,7 +301,8 @@ fn complete_handshake(
     let (handshake, init_msg) = initiator_start(client_key, server_pub)?;
 
     // Step 2: responder processes initiator message, checks allowlist, produces reply.
-    let (resp_transport, resp_msg) = responder_accept(server_key, &init_msg, allowed_clients)?;
+    let (resp_transport, _remote_key, resp_msg) =
+        responder_accept(server_key, &init_msg, allowed_clients)?;
 
     // Step 3: initiator processes reply.
     let init_transport = initiator_complete(handshake, &resp_msg)?;

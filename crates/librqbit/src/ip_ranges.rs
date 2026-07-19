@@ -13,6 +13,7 @@ use tokio_util::io::StreamReader;
 use tracing::trace;
 use url::Url;
 
+#[derive(Clone, Debug)]
 struct IntervalTreeWithSize<T> {
     t: IntervalTree<T, ()>,
     len: usize,
@@ -27,6 +28,7 @@ fn interval_tree<T: Clone + Ord>(it: impl Iterator<Item = Range<T>>) -> Interval
     IntervalTreeWithSize { t, len }
 }
 
+#[derive(Clone, Debug)]
 pub struct IpRanges {
     // We could store only one interval tree, but splitting them takes less memory,
     // as IpAddr is 17 bytes, Ipv4Addr is only 4 bytes (the majority of ranges).
