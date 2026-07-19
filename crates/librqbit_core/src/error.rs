@@ -31,19 +31,27 @@ pub enum Error {
     #[error("v2 torrent missing meta_version")]
     V2MissingMetaVersion,
     #[error("unsupported meta_version: {0}")]
-    V2UnsupportedMetaVersion(u32),
+    V2UnsupportedMetaVersion(u64),
     #[error("v2 torrent missing piece_layers")]
     V2MissingPieceLayers,
     #[error("v2 piece_layers missing entry for file: {0}")]
     V2MissingPieceLayersEntry(String),
     #[error("v2 piece_layers entry has wrong hash count: expected {expected}, got {actual}")]
     V2PieceLayersWrongSize { expected: usize, actual: usize },
-    #[error("v2 piece_layers count mismatch: expected {expected}, got {actual}")]
-    V2PieceLayerCountMismatch { expected: usize, actual: usize },
+    #[error(
+        "v2 piece_layers size mismatch for root {root}: expected file of {expected} bytes, got {actual}"
+    )]
+    V2PieceLayerSizeMismatch {
+        root: String,
+        expected: u64,
+        actual: u64,
+    },
     #[error("v2 piece_layers merkle root mismatch for file")]
     V2PieceLayersRootMismatch,
     #[error("v2 small file should not have piece_layers entry")]
     V2SmallFileShouldNotHavePieceLayers,
+    #[error("v2 file larger than piece_length missing pieces_root")]
+    V2FileMissingPiecesRoot,
     #[error("v2 small file missing pieces_root")]
     V2SmallFileMissingPiecesRoot,
     #[error("v2 zero-length file should not have pieces_root")]

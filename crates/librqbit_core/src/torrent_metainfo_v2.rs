@@ -260,6 +260,7 @@ fn validate_file<Buf: AsRef<[u8]>>(
     match (file.length, file.pieces_root) {
         (0, Some(_)) => Err(Error::V2ZeroLengthFileHasPiecesRoot),
         (0, None) => Ok(()),
+        (size, None) if size > u64::from(piece_length) => Err(Error::V2FileMissingPiecesRoot),
         (_, None) => Err(Error::V2SmallFileMissingPiecesRoot),
         (size, Some(root)) if size <= u64::from(piece_length) => {
             if piece_layers.contains_key(&root) {
@@ -271,9 +272,10 @@ fn validate_file<Buf: AsRef<[u8]>>(
         (size, Some(root)) => {
             if let Some(previous_size) = required_layers.insert(root, size) {
                 if previous_size != size {
-                    return Err(Error::V2PieceLayerCountMismatch {
-                        expected: 1,
-                        actual: 2,
+                    return Err(Error::V2PieceLayerSizeMismatch {
+                        root: hex::encode(root.0),
+                        expected: previous_size,
+                        actual: size,
                     });
                 }
             }
@@ -362,12 +364,9 @@ fn checked_piece_count_with_limit(size: u64, piece_length: u32, max_hashes: u64)
     }
     usize::try_from(count).map_err(|_| Error::V2PieceLayerCountTooLarge { count })
 }
-
 fn validate_meta_version(meta_version: u64) -> Result<()> {
     if meta_version != 2 {
-        return Err(Error::V2UnsupportedMetaVersion(
-            meta_version.try_into().unwrap_or(u32::MAX),
-        ));
+        return Err(Error::V2UnsupportedMetaVersion(meta_version));
     }
     Ok(())
 }
@@ -379,7 +378,7 @@ fn merkle_root(hashes: &[Id32], piece_length: u32) -> Id32 {
 
     while layer.len() > 1 {
         for index in 0..layer.len() / 2 {
-            layer[index] = hash_pair(layer[index], layer[index * 2 + 1]);
+            layer[index] = hash_pair(layer[index * 2], layer[index * 2 + 1]);
         }
         layer.truncate(layer.len() / 2);
     }
@@ -387,7 +386,7 @@ fn merkle_root(hashes: &[Id32], piece_length: u32) -> Id32 {
 }
 
 fn zero_hash(depth: u32) -> Id32 {
-    let mut hash = Id32::default();
+    let mut hash = Id32::new(sha2::Sha256::digest(&[0u8; BLOCK_LENGTH as usize]).into());
     for _ in 0..depth {
         hash = hash_pair(hash, hash);
     }
@@ -405,10 +404,11 @@ fn hash_pair(left: Id32, right: Id32) -> Id32 {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        checked_piece_count_with_limit, hash_pair, merkle_root, torrent_v2_from_bytes, zero_hash,
+    };
     use crate::{Error, Id32};
-
-    use super::{checked_piece_count_with_limit, torrent_v2_from_bytes};
-
+    use sha2::Digest;
     #[test]
     fn parses_v2_info_and_uses_sha256_raw_info_hash() {
         let fixture = fixture_bytes();
@@ -490,6 +490,59 @@ mod tests {
                 count: EXPECTED_COUNT
             })
         ));
+    }
+
+    #[test]
+    fn merkle_root_four_leaves_produces_correct_root() {
+        let leaf_a = Id32::new([0x01; 32]);
+        let leaf_b = Id32::new([0x02; 32]);
+        let leaf_c = Id32::new([0x03; 32]);
+        let leaf_d = Id32::new([0x04; 32]);
+
+        let expected_level1_ab = hash_pair_test(leaf_a, leaf_b);
+        let expected_level1_cd = hash_pair_test(leaf_c, leaf_d);
+        let expected_root = hash_pair_test(expected_level1_ab, expected_level1_cd);
+
+        let actual_root = super::merkle_root(&[leaf_a, leaf_b, leaf_c, leaf_d], 16 * 1024);
+        assert_eq!(actual_root, expected_root);
+    }
+
+    #[test]
+    fn merkle_root_three_leaves_pads_with_zero_hash() {
+        let leaf_a = Id32::new([0x0a; 32]);
+        let leaf_b = Id32::new([0x0b; 32]);
+        let leaf_c = Id32::new([0x0c; 32]);
+
+        let zero = super::zero_hash(0);
+        let expected_level1_ab = hash_pair_test(leaf_a, leaf_b);
+        let expected_level1_cz = hash_pair_test(leaf_c, zero);
+        let expected_root = hash_pair_test(expected_level1_ab, expected_level1_cz);
+
+        let actual_root = super::merkle_root(&[leaf_a, leaf_b, leaf_c], 16 * 1024);
+        assert_eq!(actual_root, expected_root);
+    }
+
+    #[test]
+    fn merkle_root_eight_identical_leaves_is_consistent() {
+        let leaf = Id32::new([0x42; 32]);
+        let leaves: Vec<_> = (0..8).map(|_| leaf).collect();
+        let root = super::merkle_root(&leaves, 16 * 1024);
+
+        let expected_level1 = hash_pair_test(leaf, leaf);
+        let expected_level2 = hash_pair_test(expected_level1, expected_level1);
+        let expected_root = hash_pair_test(expected_level2, expected_level2);
+        assert_eq!(root, expected_root);
+    }
+
+    #[test]
+    fn zero_hash_base_matches_bep52_block_hash() {
+        let zh0 = super::zero_hash(0);
+        let expected = Id32::new(sha2::Sha256::digest(&[0u8; 16 * 1024]).into());
+        assert_eq!(zh0, expected);
+    }
+
+    fn hash_pair_test(left: Id32, right: Id32) -> Id32 {
+        super::hash_pair(left, right)
     }
 
     fn fixture_bytes() -> Vec<u8> {
