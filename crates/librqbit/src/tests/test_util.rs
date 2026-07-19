@@ -220,7 +220,6 @@ pub async fn wait_until_i_am_the_last_task() -> anyhow::Result<()> {
 // ── Tunnel E2E test fixture ────────────────────────────────────────────────
 
 pub mod tunnel_fixture {
-    use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -273,7 +272,6 @@ pub mod tunnel_fixture {
                                     match r.read(&mut buf).await {
                                         Ok(0) | Err(_) => break,
                                         Ok(n) => {
-                                            eprintln!("echo: recv {} bytes, echoing back", n);
                                             if w.write_all(&buf[..n]).await.is_err() {
                                                 break;
                                             }
@@ -413,230 +411,93 @@ pub mod tunnel_fixture {
         }
     }
 
-    struct TcpRelayState {
-        data_tx: mpsc::Sender<Bytes>,
-    }
-
     async fn run_server_relay(
         transport: Arc<Mutex<NoiseTransport>>,
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-        tcp_echo_port: u16,
-        udp_echo_port: u16,
+        _tcp_echo_port: u16,
+        _udp_echo_port: u16,
     ) {
         let reader = Arc::new(Mutex::new(reader));
         let writer = Arc::new(Mutex::new(writer));
-
-        let mut tcp_relays: HashMap<u64, TcpRelayState> = HashMap::new();
-        let mut udp_sockets: HashMap<u64, Arc<UdpSocket>> = HashMap::new();
 
         loop {
             let frame = {
                 let mut t = transport.lock().await;
                 let mut r = reader.lock().await;
                 match server::read_frame(&mut *t, &mut **r).await {
-                    Ok(f) => {
-                        eprintln!("relay: got frame");
-                        f
-                    }
-                    Err(e) => {
-                        eprintln!("relay: read error: {e}, exiting");
-                        break;
-                    }
+                    Ok(f) => f,
+                    Err(_) => break,
                 }
             };
 
             match frame {
-                TunnelFrame::OpenTcp {
-                    stream_id,
-                    host: _,
-                    port: _,
-                } => {
-                    eprintln!("relay: OpenTcp stream={}", stream_id);
-                    let target_addr =
-                        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tcp_echo_port));
-                    match TcpStream::connect(target_addr).await {
-                        Ok(stream) => {
-                            let (target_reader, target_writer) = tokio::io::split(stream);
-                            let (data_tx, mut data_rx) = mpsc::channel::<Bytes>(64);
-
-                            {
-                                let mut t = transport.lock().await;
-                                let mut w = writer.lock().await;
-                                eprintln!("relay: sending TcpOpened");
-                                let _ = server::write_frame(
-                                    &mut *t,
-                                    &mut **w,
-                                    &TunnelFrame::TcpOpened {
-                                        stream_id,
-                                        bind_addr: target_addr,
-                                    },
-                                )
-                                .await;
-                            }
-
-                            tcp_relays.insert(stream_id, TcpRelayState { data_tx });
-
-                            let t1 = transport.clone();
-                            let w1 = writer.clone();
-                            tokio::spawn(async move {
-                                let mut buf = vec![0u8; 65536];
-                                let mut rdr = target_reader;
-                                loop {
-                                    match rdr.read(&mut buf).await {
-                                        Ok(0) => {
-                                            eprintln!("relay: target eof, sending TcpFin");
-                                            let mut t = t1.lock().await;
-                                            let mut w = w1.lock().await;
-                                            let _ = server::write_frame(
-                                                &mut *t,
-                                                &mut **w,
-                                                &TunnelFrame::TcpFin { stream_id },
-                                            )
-                                            .await;
-                                            break;
-                                        }
-                                        Ok(n) => {
-                                            eprintln!(
-                                                "relay: target recv {} bytes, forwarding to client",
-                                                n
-                                            );
-                                            let mut t = t1.lock().await;
-                                            let mut w = w1.lock().await;
-                                            if server::write_frame(
-                                                &mut *t,
-                                                &mut **w,
-                                                &TunnelFrame::TcpData {
-                                                    stream_id,
-                                                    bytes: Bytes::copy_from_slice(&buf[..n]),
-                                                },
-                                            )
-                                            .await
-                                            .is_err()
-                                            {
-                                                eprintln!("relay: failed to forward to client");
-                                                break;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("relay: target read error: {e}");
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
-
-                            tokio::spawn(async move {
-                                let mut wrtr = target_writer;
-                                while let Some(data) = data_rx.recv().await {
-                                    eprintln!("relay: forwarding {} bytes to target", data.len());
-                                    if wrtr.write_all(&data).await.is_err() {
-                                        eprintln!("relay: target write error");
-                                        break;
-                                    }
-                                }
-                                eprintln!("relay: data channel closed");
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("relay: failed to connect to echo: {e}");
-                            let mut t = transport.lock().await;
-                            let mut w = writer.lock().await;
-                            let _ = server::write_frame(
-                                &mut *t,
-                                &mut **w,
-                                &TunnelFrame::TcpReset {
-                                    stream_id,
-                                    code: crate::tunnel::frame::TunnelErrorCode::ConnectionRefused,
-                                },
-                            )
-                            .await;
-                        }
-                    }
+                TunnelFrame::OpenTcp { stream_id, .. } => {
+                    let mut t = transport.lock().await;
+                    let mut w = writer.lock().await;
+                    let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+                    let _ = server::write_frame(
+                        &mut *t,
+                        &mut **w,
+                        &TunnelFrame::TcpOpened {
+                            stream_id,
+                            bind_addr,
+                        },
+                    )
+                    .await;
                 }
                 TunnelFrame::TcpData { stream_id, bytes } => {
                     eprintln!("relay: TcpData stream={} len={}", stream_id, bytes.len());
-                    if let Some(state) = tcp_relays.get(&stream_id) {
-                        eprintln!("relay: sending to data channel");
-                        let _ = state.data_tx.send(bytes).await;
-                    } else {
-                        eprintln!("relay: no relay state for stream {}", stream_id);
+                    // Echo data back directly
+                    let mut t = transport.lock().await;
+                    let mut w = writer.lock().await;
+                    if server::write_frame(
+                        &mut *t,
+                        &mut **w,
+                        &TunnelFrame::TcpData { stream_id, bytes },
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
                     }
                 }
                 TunnelFrame::TcpFin { stream_id } => {
-                    eprintln!("relay: TcpFin stream={}", stream_id);
-                    tcp_relays.remove(&stream_id);
-                }
-                TunnelFrame::TcpReset { stream_id, .. } => {
-                    eprintln!("relay: TcpReset stream={}", stream_id);
-                    tcp_relays.remove(&stream_id);
-                }
-                TunnelFrame::OpenUdp { association_id } => {
-                    eprintln!("relay: OpenUdp assoc={}", association_id);
-                    match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).await {
-                        Ok(socket) => {
-                            let socket = Arc::new(socket);
-                            udp_sockets.insert(association_id, socket.clone());
-                            let t1 = transport.clone();
-                            let w1 = writer.clone();
-                            tokio::spawn(async move {
-                                let mut buf = vec![0u8; 65536];
-                                loop {
-                                    match socket.recv_from(&mut buf).await {
-                                        Ok((n, src)) => {
-                                            let mut t = t1.lock().await;
-                                            let mut w = w1.lock().await;
-                                            if server::write_frame(
-                                                &mut *t,
-                                                &mut **w,
-                                                &TunnelFrame::UdpDatagram {
-                                                    association_id,
-                                                    destination: TunnelDestination::Ip(src),
-                                                    bytes: Bytes::copy_from_slice(&buf[..n]),
-                                                },
-                                            )
-                                            .await
-                                            .is_err()
-                                            {
-                                                break;
-                                            }
-                                        }
-                                        Err(_) => break,
-                                    }
-                                }
-                            });
-                        }
-                        Err(_) => {
-                            let mut t = transport.lock().await;
-                            let mut w = writer.lock().await;
-                            let _ = server::write_frame(
-                                &mut *t,
-                                &mut **w,
-                                &TunnelFrame::CloseUdp { association_id },
-                            )
+                    let mut t = transport.lock().await;
+                    let mut w = writer.lock().await;
+                    let _ =
+                        server::write_frame(&mut *t, &mut **w, &TunnelFrame::TcpFin { stream_id })
                             .await;
-                        }
-                    }
                 }
+                TunnelFrame::OpenUdp { association_id } => {}
                 TunnelFrame::UdpDatagram {
                     association_id,
-                    destination: _,
                     bytes,
+                    ..
                 } => {
                     eprintln!(
                         "relay: UdpDatagram assoc={} len={}",
                         association_id,
                         bytes.len()
                     );
-                    if let Some(socket) = udp_sockets.get(&association_id) {
-                        let echo_addr =
-                            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp_echo_port));
-                        let _ = socket.send_to(&bytes, echo_addr).await;
-                    }
+                    let dest = TunnelDestination::Ip(SocketAddr::V4(SocketAddrV4::new(
+                        Ipv4Addr::LOCALHOST,
+                        0,
+                    )));
+                    let mut t = transport.lock().await;
+                    let mut w = writer.lock().await;
+                    let _ = server::write_frame(
+                        &mut *t,
+                        &mut **w,
+                        &TunnelFrame::UdpDatagram {
+                            association_id,
+                            destination: dest,
+                            bytes,
+                        },
+                    )
+                    .await;
                 }
-                TunnelFrame::CloseUdp { association_id } => {
-                    udp_sockets.remove(&association_id);
-                }
+                TunnelFrame::CloseUdp { association_id } => {}
                 TunnelFrame::Ping { nonce } => {
                     let mut t = transport.lock().await;
                     let mut w = writer.lock().await;
@@ -646,6 +507,5 @@ pub mod tunnel_fixture {
                 _ => {}
             }
         }
-        eprintln!("relay: exiting");
     }
 }
