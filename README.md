@@ -85,47 +85,101 @@ rqbit --socks-url socks5://[username:password]@host:port ...
 
 ## Tunnel mode
 
-rqbit can operate as an encrypted TCP tunnel between a desktop client behind
-NAT and a reachable VPS server, without using the DHT or a tracker for the
-tunnel carrier.  The server allowlists client public keys — only authorized
-clients may connect.
+rqbit can operate as an **encrypted TCP tunnel** between a desktop client behind
+NAT and a reachable VPS server. The tunnel uses a private BitTorrent v2 (BEP 52)
+carrier — the BitTorrent peer-wire between client and server looks like a
+legitimate torrent swarm to any observer.
+
+**Encryption layers:**
+1. **Outer:** MSE/PE (Message Stream Encryption / Protocol Encryption) —
+   standard BitTorrent peer-wire obfuscation.
+2. **Inner:** Noise IK (Curve25519 + ChaChaPoly) — static-key authenticated
+   encryption of every tunnel frame.
 
 **Traffic flow:**
-- Local applications (browser, curl, etc.) point at the **client loopback SOCKS address** (`127.0.0.1:1080` by default).
-- **Client-to-VPS** is the *encrypted carrier leg* — data is framed inside
-  Noise-encrypted BitTorrent peer-wire connections carried through a
-  dedicated torrent swarm between client and server.
-- **VPS-to-destination** is normal, unencrypted destination traffic — the
-  VPS egresses requests as a standard TCP connection to the target host.
+- Local applications (browser, curl, etc.) **→** client loopback SOCKS5 (`127.0.0.1:1080`).
+- **Client → VPS:** encrypted carrier leg (Noise frames inside BitTorrent peer-wire).
+- **VPS → destination:** normal TCP (the VPS egresses requests to the target host).
+
+The server allowlists client public keys — only authorized clients may connect.
+No DHT, tracker, or persistence state is used for the tunnel carrier.
+
+### Key generation
+
+Use the included key generation script:
+
+```bash
+pip install cryptography
+python3 scripts/rqbit-tunnel-keygen.py --output-dir ~/.rqbit/tunnel-keys
+```
+
+This produces:
+
+| File | Permissions | Purpose |
+|------|------------|---------|
+| `client.key` | `600` (secret) | Client x25519 private key |
+| `client.pub` | `644` (public) | Client x25519 public key |
+| `server.key` | `600` (secret) | Server x25519 private key |
+| `server.pub` | `644` (public) | Server x25519 public key |
+
+Keys are 32-byte hex-encoded values (64 hex characters).
+
+**Security:** Never share `.key` files. Only `.pub` files should be exchanged
+between client and server operators.
 
 ### VPS server
 
-```
+```bash
+# Create allowed-clients file with the client's public key
+echo "CLIENT_PUB_HEX" > /etc/rqbit/allowed-clients.txt
+
 rqbit server start /data \
   --tunnel-mode server \
   --tunnel-peer-listen 0.0.0.0:4242 \
   --tunnel-server-key /etc/rqbit/server.key \
-  --tunnel-allowed-clients /etc/rqbit/clients.txt \
+  --tunnel-allowed-clients /etc/rqbit/allowed-clients.txt \
   --tunnel-carrier-root /var/lib/rqbit/tunnel
 ```
 
 ### Desktop client
 
-```
+```bash
 rqbit server start /data \
   --tunnel-mode client \
   --tunnel-socks-listen 127.0.0.1:1080 \
   --tunnel-server-addr vps.example.com:4242 \
   --tunnel-client-key ~/.rqbit/client.key \
-  --tunnel-server-key ~/.rqbit/server.pub \
-  --tunnel-pairing ~/.rqbit/pairing.bin
+  --tunnel-server-key ~/.rqbit/server.pub
 ```
 
-Keys are 32-byte hex-encoded values.  The server key is the server's own
-identity (private) key in server mode, and the server's *public* key in
-client mode.  Client identities are always private keys.  The pairing bundle
-(`--tunnel-pairing`) is a JSON file with the info-hash and initial peers
-for the carrier swarm.
+### Using the tunnel
+
+Point any SOCKS5-compatible application at `127.0.0.1:1080`:
+
+```bash
+# curl
+curl --socks5 127.0.0.1:1080 https://checkip.amazonaws.com
+# → shows your VPS IP
+
+# Firefox: Settings → Network Settings → SOCKS Host: 127.0.0.1, Port: 1080, SOCKS v5
+```
+
+### Environment variables
+
+Every `--tunnel-*` flag has a corresponding `RQBIT_TUNNEL_*` environment variable:
+
+| Flag | Environment variable |
+|------|---------------------|
+| `--tunnel-mode` | `RQBIT_TUNNEL_MODE` |
+| `--tunnel-socks-listen` | `RQBIT_TUNNEL_SOCKS_LISTEN` |
+| `--tunnel-server-addr` | `RQBIT_TUNNEL_SERVER_ADDR` |
+| `--tunnel-peer-listen` | `RQBIT_TUNNEL_PEER_LISTEN` |
+| `--tunnel-client-key` | `RQBIT_TUNNEL_CLIENT_KEY` |
+| `--tunnel-server-key` | `RQBIT_TUNNEL_SERVER_KEY` |
+| `--tunnel-allowed-clients` | `RQBIT_TUNNEL_ALLOWED_CLIENTS` |
+| `--tunnel-pairing` | `RQBIT_TUNNEL_PAIRING` |
+| `--tunnel-carrier-root` | `RQBIT_TUNNEL_CARRIER_ROOT` |
+| `--tunnel-egress-policy` | `RQBIT_TUNNEL_EGRESS_POLICY` |
 
 ## Watching a directory for .torrents
 
