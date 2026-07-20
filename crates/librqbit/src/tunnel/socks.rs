@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
 use super::client_mux::{ClientMux, InboundTcp, InboundUdp};
-use super::client_supervisor::TunnelClientSupervisor;
+use super::client_pool::CarrierPool;
 use super::config::{OPEN_TIMEOUT, READ_CHUNK};
 use super::flow::SendCredit;
 use super::frame::{TunnelDestination, TunnelErrorCode};
@@ -109,12 +109,12 @@ impl SocksIngress {
     }
 
     /// Run the SOCKS5 accept loop, dispatching each connection onto whichever
-    /// tunnel mux is currently connected (via the supervisor). If the tunnel is
-    /// not connected the SOCKS connection is dropped.
+    /// tunnel carrier is least loaded (via the pool). If no carrier is
+    /// connected the SOCKS connection is dropped.
     pub(crate) async fn run(
         self,
         listener: TcpListener,
-        supervisor: Arc<TunnelClientSupervisor>,
+        pool: Arc<CarrierPool>,
         shutdown: CancellationToken,
     ) {
         loop {
@@ -122,12 +122,12 @@ impl SocksIngress {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
-                            let mux = match supervisor.current() {
-                                Some(mux) if !mux.is_shutdown() => mux,
-                                _ => {
+                            let mux = match pool.pick() {
+                                Some(mux) => mux,
+                                None => {
                                     tracing::debug!(
                                         client_addr = %addr,
-                                        "tunnel not connected; dropping SOCKS connection"
+                                        "no live tunnel carrier; dropping SOCKS connection"
                                     );
                                     continue;
                                 }

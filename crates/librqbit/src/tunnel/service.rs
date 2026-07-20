@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::session::Session;
 
-use super::client_supervisor::TunnelClientSupervisor;
+use super::client_pool::CarrierPool;
 use super::options::TunnelOptions;
 use super::server::TunnelServer;
 use super::socks::SocksIngress;
@@ -49,22 +49,22 @@ impl TunnelService {
             TunnelOptions::Client(opts) => {
                 // ── Bind SOCKS5 listener up front ───────────────────────────
                 // The listener stays up for the whole session; the tunnel
-                // connection is established and re-established in the background
-                // by the supervisor, so session startup does not fail (and the
-                // proxy does not go away) just because the server is briefly
-                // unreachable.
+                // connections are established and re-established in the
+                // background by the pool's supervisors, so session startup
+                // does not fail (and the proxy does not go away) just because
+                // the server is briefly unreachable.
                 let listener = TcpListener::bind(opts.socks_listen).await?;
                 let local_addr = listener.local_addr()?;
 
                 // The session's DHT (if enabled) lets the client discover the
                 // server by its carrier hash instead of a fixed address.
                 let dht = session.get_dht().cloned();
-                let supervisor = TunnelClientSupervisor::start(opts, dht, shutdown.clone());
+                let pool = CarrierPool::start(opts, dht, shutdown.clone());
 
                 let ingress = SocksIngress::new(local_addr);
                 let socks_shutdown = shutdown.clone();
                 tokio::spawn(async move {
-                    ingress.run(listener, supervisor, socks_shutdown).await;
+                    ingress.run(listener, pool, socks_shutdown).await;
                 });
 
                 tracing::info!("tunnel client SOCKS5 listening on {local_addr}");
