@@ -5,10 +5,11 @@
 //   * `SendCredit` — credit-based flow control. A sender must `reserve(n)`
 //     before transmitting `n` payload bytes; the peer replenishes credit via
 //     `Credit` frames as it drains received data. This bounds the amount of
-//     unacknowledged in-flight data per stream to `INITIAL_WINDOW`, which in
-//     turn bounds the receiver's per-stream buffer — so a single slow stream
-//     can never fill a buffer deep enough to block the shared frame reader
-//     (no head-of-line blocking across streams).
+//     unacknowledged in-flight data per stream to the configured window
+//     (`DEFAULT_WINDOW` by default), which in turn bounds the receiver's
+//     per-stream buffer — so a single slow stream can never fill a buffer
+//     deep enough to block the shared frame reader (no head-of-line blocking
+//     across streams).
 //
 //   * `IdleGuard` — a bidirectional idle watchdog. Activity in EITHER
 //     direction pokes it; if nothing happens for the idle timeout the stream
@@ -22,7 +23,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use super::config::INITIAL_WINDOW;
+use super::config::DEFAULT_WINDOW;
 
 // ── Credit-based flow control ───────────────────────────────────────────────
 
@@ -33,10 +34,17 @@ pub(crate) struct SendCredit {
 }
 
 impl SendCredit {
-    /// A fresh credit pool seeded with the initial window.
+    /// A fresh credit pool seeded with the default window.
     pub(crate) fn new() -> Self {
+        Self::with_window(DEFAULT_WINDOW)
+    }
+
+    /// A fresh credit pool seeded with `window` bytes of credit. This is the
+    /// seam a later task uses to pass a per-stream adaptive value; `new()`
+    /// just fixes it to `DEFAULT_WINDOW`.
+    pub(crate) fn with_window(window: usize) -> Self {
         Self {
-            sem: Arc::new(Semaphore::new(INITIAL_WINDOW)),
+            sem: Arc::new(Semaphore::new(window)),
         }
     }
 
@@ -49,7 +57,7 @@ impl SendCredit {
         if n == 0 {
             return true;
         }
-        // Chunks are always <= INITIAL_WINDOW, so this fits the pool.
+        // Chunks are always <= the configured window, so this fits the pool.
         match self.sem.acquire_many(n as u32).await {
             Ok(permit) => {
                 permit.forget();
@@ -115,5 +123,36 @@ impl IdleGuard {
     /// Report activity, resetting the idle countdown.
     pub(crate) fn poke(&self) {
         self.notify.notify_one();
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn with_window_allows_exactly_window_bytes_then_blocks() {
+        let credit = SendCredit::with_window(1024);
+
+        // Reserving the whole window (and a zero-sized reserve) succeeds
+        // immediately.
+        assert!(credit.reserve(0).await);
+        assert!(credit.reserve(1024).await);
+
+        // The pool is now exhausted: a further reserve must stay pending
+        // until credit is granted back.
+        let pending = credit.reserve(1);
+        tokio::pin!(pending);
+        let timed_out = tokio::time::timeout(Duration::from_millis(50), &mut pending).await;
+        assert!(
+            timed_out.is_err(),
+            "reserve(1) should still be pending once the window is exhausted"
+        );
+
+        // Granting credit unblocks it.
+        credit.grant(1);
+        assert!(pending.await);
     }
 }

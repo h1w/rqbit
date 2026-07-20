@@ -664,13 +664,13 @@ async fn build_real_relay_pair() -> (
 }
 
 /// Transfer more than one flow-control window through the real relay against a
-/// real loopback echo server. A payload larger than `INITIAL_WINDOW` can only
+/// real loopback echo server. A payload larger than `DEFAULT_WINDOW` can only
 /// complete if credit is granted and replenished in BOTH directions — so this
 /// exercises the whole credit machinery end-to-end without deadlocking.
 #[tokio::test]
 async fn real_relay_transfers_large_payload_with_flow_control() {
     use crate::tunnel::client_mux::{ClientMux, InboundTcp};
-    use crate::tunnel::config::INITIAL_WINDOW;
+    use crate::tunnel::config::DEFAULT_WINDOW;
     use crate::tunnel::egress::EgressPolicy;
     use crate::tunnel::relay::run_server_relay;
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -716,7 +716,7 @@ async fn real_relay_transfers_large_payload_with_flow_control() {
 
     // Exceed the flow window so credit must be granted AND replenished in both
     // directions (a single window would complete without any replenishment).
-    let total: usize = 2 * INITIAL_WINDOW + 512 * 1024;
+    let total: usize = 2 * DEFAULT_WINDOW + 512 * 1024;
     const CHUNK: usize = 16 * 1024;
 
     // Sender: respects flow-control credit.

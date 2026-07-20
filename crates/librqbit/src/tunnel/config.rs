@@ -19,12 +19,18 @@ pub(crate) const UDP_READ_BUF: usize = 64 * 1024;
 
 // ── Flow control ────────────────────────────────────────────────────────────
 
-/// Initial per-stream receive window (bytes). Both peers assume this much
-/// credit at stream open, so no window-advertisement handshake is needed.
-/// Larger values improve throughput on high bandwidth-delay-product links
-/// (throughput ≈ window / RTT for a single bulk stream) at the cost of more
-/// per-stream buffering (worst case ≈ window × max streams per client).
-pub(crate) const INITIAL_WINDOW: usize = 4 * 1024 * 1024;
+/// Default per-stream credit window. Lower than the old 4 MiB to bound
+/// in-flight data (bufferbloat); many concurrent streams still fill the link.
+/// Both peers assume this much credit at stream open, so no
+/// window-advertisement handshake is needed. Larger values improve throughput
+/// on high bandwidth-delay-product links (throughput ≈ window / RTT for a
+/// single bulk stream) at the cost of more per-stream buffering (worst case ≈
+/// window × max streams per client).
+pub(crate) const DEFAULT_WINDOW: usize = 256 * 1024;
+
+/// Clamp bounds for the adaptive window (used by later B2 tasks).
+pub(crate) const MIN_WINDOW: usize = 64 * 1024;
+pub(crate) const MAX_WINDOW: usize = 4 * 1024 * 1024;
 
 // ── Queue depths ────────────────────────────────────────────────────────────
 
@@ -36,11 +42,11 @@ pub(crate) const OUTBOUND_QUEUE: usize = 256;
 /// credit-limited sender can then never fill the queue, so the shared frame
 /// reader never blocks on a single stream (no head-of-line blocking). The `+8`
 /// is slack for control frames.
-pub(crate) const PER_STREAM_QUEUE: usize = INITIAL_WINDOW / READ_CHUNK + 8;
+pub(crate) const PER_STREAM_QUEUE: usize = DEFAULT_WINDOW / READ_CHUNK + 8;
 
 /// Bound on the client mux's per-connection inbound queue (TCP events / UDP
 /// datagrams routed to a single SOCKS handler). Same window-derived sizing.
-pub(crate) const PER_CONN_QUEUE: usize = INITIAL_WINDOW / READ_CHUNK + 8;
+pub(crate) const PER_CONN_QUEUE: usize = DEFAULT_WINDOW / READ_CHUNK + 8;
 
 // ── Timeouts ────────────────────────────────────────────────────────────────
 
