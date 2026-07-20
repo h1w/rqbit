@@ -521,6 +521,31 @@ enum SubCommand {
     Download(DownloadOpts),
     /// Shell completions. eval "$(rqbit completions bash)"
     Completions(CompletionsOpts),
+    /// Encrypted tunnel utilities (key generation).
+    Tunnel(TunnelOpts),
+}
+
+#[derive(Parser)]
+struct TunnelOpts {
+    #[command(subcommand)]
+    subcommand: TunnelSubcommand,
+}
+
+#[derive(Parser)]
+enum TunnelSubcommand {
+    /// Generate `client` and `server` x25519 keypairs for the tunnel.
+    ///
+    /// Writes client.key/client.pub and server.key/server.pub (hex-encoded).
+    /// No pairing bundle is needed — the carrier identity is derived from the
+    /// server key on both sides.
+    Keygen(TunnelKeygenOpts),
+}
+
+#[derive(Parser)]
+struct TunnelKeygenOpts {
+    /// Directory to write the key files into (created if missing).
+    #[arg(long, default_value = ".")]
+    output_dir: PathBuf,
 }
 
 /// Return the API listener socket passed to rqbit by systemd, if any.
@@ -583,6 +608,11 @@ fn main() -> anyhow::Result<()> {
             &mut io::stdout(),
         );
         return Ok(());
+    }
+
+    // Tunnel utilities need neither a tokio runtime nor a session.
+    if let SubCommand::Tunnel(tunnel_opts) = &opts.subcommand {
+        return run_tunnel_subcommand(tunnel_opts);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -892,6 +922,46 @@ fn build_tunnel_opts(opts: &mut Opts) -> anyhow::Result<Option<TunnelOptions>> {
             })))
         }
     }
+}
+
+fn run_tunnel_subcommand(opts: &TunnelOpts) -> anyhow::Result<()> {
+    match &opts.subcommand {
+        TunnelSubcommand::Keygen(k) => tunnel_keygen(&k.output_dir),
+    }
+}
+
+/// Generate `client` and `server` x25519 keypairs and write them (hex-encoded)
+/// into `dir`. Private keys are written with mode 0600 on unix.
+fn tunnel_keygen(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("cannot create output dir {}", dir.display()))?;
+
+    println!("Generating rqbit tunnel keys in {}:", dir.display());
+    for name in ["client", "server"] {
+        let (priv_key, pub_key) = librqbit::tunnel_generate_keypair();
+        let key_path = dir.join(format!("{name}.key"));
+        let pub_path = dir.join(format!("{name}.pub"));
+
+        std::fs::write(&key_path, format!("{}\n", hex::encode(priv_key.0)))
+            .with_context(|| format!("cannot write {}", key_path.display()))?;
+        std::fs::write(&pub_path, format!("{}\n", hex::encode(pub_key.0)))
+            .with_context(|| format!("cannot write {}", pub_path.display()))?;
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("cannot chmod {}", key_path.display()))?;
+        }
+
+        println!("  {}  (private — keep secret)", key_path.display());
+        println!("  {}  (public — safe to share)", pub_path.display());
+    }
+
+    println!();
+    println!("Server keeps: server.key  +  allowed-clients file containing client.pub");
+    println!("Client keeps: client.key  +  server.pub");
+    Ok(())
 }
 
 async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result<()> {
@@ -1305,6 +1375,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             http_api_fut.await
         }
         SubCommand::Completions(_) => unreachable!(),
+        SubCommand::Tunnel(_) => unreachable!(),
     }
 }
 
