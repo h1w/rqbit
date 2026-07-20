@@ -298,31 +298,91 @@ impl<R: AsyncRead + Unpin> AsyncRead for EncryptedReader<R> {
 }
 
 /// An `AsyncWrite` wrapper that encrypts with RC4 on the fly.
+///
+/// RC4 is a stream cipher: its keystream advances by exactly the number of
+/// bytes encrypted, and both peers must consume the keystream in lockstep. The
+/// underlying writer may accept fewer bytes than offered (a partial or
+/// would-block write), so we must NOT re-encrypt the same plaintext twice.
+/// Instead, we encrypt each input once and buffer any ciphertext the inner
+/// writer did not accept, draining it before encrypting anything new.
 struct EncryptedWriter<W> {
     inner: W,
     cipher: Rc4Cipher,
+    /// Ciphertext already advanced through the keystream but not yet written.
+    pending: Vec<u8>,
+}
+
+impl<W: AsyncWrite + Unpin> EncryptedWriter<W> {
+    /// Push buffered ciphertext to `inner`; `Ready(Ok(()))` once fully drained.
+    fn drain_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !self.pending.is_empty() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.pending) {
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(n)) => {
+                    self.pending.drain(..n);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for EncryptedWriter<W> {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, io::Error>> {
+        let this = self.get_mut();
+
+        // Never encrypt new plaintext while ciphertext from a previous partial
+        // write is still pending — that would reorder the keystream.
+        match this.drain_pending(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         let mut encrypted = buf.to_vec();
-        rc4_apply(&mut self.cipher, &mut encrypted);
-        Pin::new(&mut self.inner).poll_write(cx, &encrypted)
+        rc4_apply(&mut this.cipher, &mut encrypted);
+        match Pin::new(&mut this.inner).poll_write(cx, &encrypted) {
+            Poll::Ready(Ok(n)) => {
+                if n < encrypted.len() {
+                    this.pending.extend_from_slice(&encrypted[n..]);
+                }
+                // The whole input has been encrypted and is now either written
+                // or buffered, so it is fully consumed from the caller's view.
+                Poll::Ready(Ok(buf.len()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => {
+                // Already advanced the keystream; buffer everything so it is
+                // neither lost nor re-encrypted, and report it consumed.
+                this.pending.extend_from_slice(&encrypted);
+                Poll::Ready(Ok(buf.len()))
+            }
+        }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        match this.drain_pending(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_flush(cx),
+            other => other,
+        }
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        let this = self.get_mut();
+        match this.drain_pending(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut this.inner).poll_shutdown(cx),
+            other => other,
+        }
     }
 }
 
@@ -395,6 +455,7 @@ where
             let writer: BoxAsyncWrite = Box::new(EncryptedWriter {
                 inner: write_half,
                 cipher: encrypt_cipher,
+                pending: Vec::new(),
             });
             return Ok(EncryptedPeerIo { reader, writer });
         }
@@ -452,6 +513,7 @@ where
             let writer: BoxAsyncWrite = Box::new(EncryptedWriter {
                 inner: write_half,
                 cipher: encrypt_cipher,
+                pending: Vec::new(),
             });
             return Ok(EncryptedPeerIo { reader, writer });
         }
