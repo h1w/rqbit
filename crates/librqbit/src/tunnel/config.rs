@@ -131,6 +131,13 @@ pub(crate) const PACING_DEFAULT_RATE: u64 = 10 * 1024 * 1024 * 1024;
 /// smooths sustained throughput rather than adding latency to every frame.
 pub(crate) const PACING_BURST: u64 = 256 * 1024;
 
+/// Floor for the writer's pacing rate once the controller drives it live from
+/// `target / rtt` (bytes/s). Guards the pathological small-target / large-RTT
+/// combination — without it a tiny target over a multi-second RTT would compute
+/// a near-zero rate and stall the writer. The writer can always push at least
+/// this much, so forward progress (and thus fresh RTT samples) is guaranteed.
+pub(crate) const MIN_PACING_RATE: u64 = MIN_TARGET as u64;
+
 // ── Carriers ─────────────────────────────────────────────────────────────────
 
 /// Default number of parallel carrier connections a client opens to the server.

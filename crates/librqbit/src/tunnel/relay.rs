@@ -35,7 +35,10 @@ use super::config::{
 };
 use super::crypto::{NoiseTransport, TunnelCryptoError};
 use super::egress::{EgressPolicy, EgressTransport};
-use super::flow::{IdleGuard, RttEstimator, SendCredit, TokenBucket, record_ping_sent};
+use super::flow::{
+    IdleGuard, RttEstimator, SendCredit, TokenBucket, WindowController, drive_flow_control,
+    record_ping_sent,
+};
 use super::frame::{MAX_FRAME_PAYLOAD, TunnelDestination, TunnelErrorCode, TunnelFrame};
 use super::server::AdmittedPeer;
 
@@ -135,15 +138,28 @@ pub(crate) fn spawn_frame_writer(
                 }
             };
 
-            // Pace on the encrypted blob's length (the wire-relevant size:
-            // the ciphertext actually written, excluding only the 2-byte
-            // length prefix). Re-read the rate each iteration so a live
-            // controller update takes effect on the very next frame.
-            bucket.set_rate(pacing_rate.load(Ordering::Relaxed));
-            let now_nanos = base.elapsed().as_nanos() as u64;
-            let delay_nanos = bucket.take(now_nanos, blob.len() as u64);
-            if delay_nanos > 0 {
-                tokio::time::sleep(Duration::from_nanos(delay_nanos)).await;
+            // Pace DATA frames only. Now that the rate is real (the controller
+            // drives it to `target / rtt`), pacing control frames would break
+            // the very mechanisms pacing depends on: delaying a `Credit` stalls
+            // flow control, and delaying a `Ping`/`Pong` corrupts the RTT
+            // measurement that feeds the controller (a feedback loop). All
+            // control frames pass through with zero pacing delay; only the
+            // bulk-carrying `TcpData` / `UdpDatagram` frames are metered.
+            //
+            // Pace on the encrypted blob's length (the wire-relevant size: the
+            // ciphertext actually written, excluding only the 2-byte length
+            // prefix). Re-read the rate each iteration so a live controller
+            // update takes effect on the very next frame.
+            if matches!(
+                frame,
+                TunnelFrame::TcpData { .. } | TunnelFrame::UdpDatagram { .. }
+            ) {
+                bucket.set_rate(pacing_rate.load(Ordering::Relaxed));
+                let now_nanos = base.elapsed().as_nanos() as u64;
+                let delay_nanos = bucket.take(now_nanos, blob.len() as u64);
+                if delay_nanos > 0 {
+                    tokio::time::sleep(Duration::from_nanos(delay_nanos)).await;
+                }
             }
 
             let len = (blob.len() as u16).to_be_bytes();
@@ -212,24 +228,38 @@ pub(crate) async fn run_server_relay(
     } = peer;
 
     let transport = Arc::new(Mutex::new(transport));
-    // Phase A: seed at the effectively-unlimited default; a later controller
-    // task (Task E) can update this cell live to pace the connection.
+    // ONE pacing-rate cell shared by the writer (which re-reads it per frame)
+    // and the control task below (which drives it to `target / rtt`). Seeded at
+    // the effectively-unlimited default until the first RTT sample lands.
     let pacing_rate = Arc::new(AtomicU64::new(super::config::PACING_DEFAULT_RATE));
-    let (sink, writer_handle) =
-        spawn_frame_writer(transport.clone(), writer, shutdown.clone(), pacing_rate);
+    let (sink, writer_handle) = spawn_frame_writer(
+        transport.clone(),
+        writer,
+        shutdown.clone(),
+        pacing_rate.clone(),
+    );
 
     let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
     let udp: UdpMap = Arc::new(Mutex::new(HashMap::new()));
 
     // Per-carrier RTT measurement (§flow::RttEstimator): our own ping task
     // probes the download direction; the `Ping` arm below answers the
-    // client's pings so it can measure the upload direction. Feeds the later
-    // adaptive-window controller.
+    // client's pings so it can measure the upload direction.
     let rtt = Arc::new(StdMutex::new(RttEstimator::new()));
+    // Delay-adaptive in-flight controller + a "bytes sent since last tick"
+    // counter (incremented on every dest→peer `TcpData` in `open_and_pump`).
+    // The control task steps the controller from queuing delay + utilization
+    // and drives `pacing_rate`; new streams seed their send window from it.
+    let controller = Arc::new(StdMutex::new(WindowController::new()));
+    let bytes_sent = Arc::new(AtomicU64::new(0));
     let ping_inflight: PingInflight = Arc::new(StdMutex::new(HashMap::new()));
-    tokio::spawn(server_ping_task(
+    tokio::spawn(server_control_task(
         sink.clone(),
         ping_inflight.clone(),
+        rtt.clone(),
+        controller.clone(),
+        bytes_sent.clone(),
+        pacing_rate.clone(),
         shutdown.clone(),
     ));
 
@@ -268,7 +298,11 @@ pub(crate) async fn run_server_relay(
                 }
                 let (to_dest_tx, to_dest_rx) = mpsc::channel::<PeerToDest>(PER_STREAM_QUEUE);
                 let stream_token = shutdown.child_token();
-                let send_credit = SendCredit::new();
+                // Seed the dest→peer send window from the carrier's controller,
+                // split across the streams already open (this one not yet
+                // inserted, so `map.len()` is the pre-existing count).
+                let window = controller.lock().unwrap().per_stream_window(map.len());
+                let send_credit = SendCredit::with_window(window);
                 let idle = IdleGuard::spawn(egress.idle_timeout, stream_token.clone());
                 map.insert(
                     stream_id,
@@ -291,6 +325,7 @@ pub(crate) async fn run_server_relay(
                     to_dest_rx,
                     send_credit,
                     idle,
+                    bytes_sent.clone(),
                     stream_token,
                 ));
             }
@@ -420,15 +455,25 @@ pub(crate) async fn run_server_relay(
     tracing::debug!(?client_key, "tunnel server relay: peer session ended");
 }
 
-/// Mirrors the client mux's `ping_task`: probe RTT on the download direction
-/// (from the server's perspective) with our own periodic `Ping`s. The
+/// Mirrors the client mux's control task: probe RTT on the download direction
+/// (from the server's perspective) with our own periodic `Ping`s, then drive
+/// the carrier's `WindowController` + pacing rate from the freshest sample. The
 /// `Ping` arm in `run_server_relay` already answers the client's pings, which
-/// is how the client measures the upload direction.
+/// is how the client measures the upload direction; the `Pong` arm records our
+/// own probes' samples into `rtt`.
 ///
 /// Stops on shutdown, or once the sink is gone — which happens shortly after
 /// `run_server_relay` aborts the writer task on peer disconnect, since that
 /// closes the channel `sink.send` writes to.
-async fn server_ping_task(sink: FrameSink, inflight: PingInflight, shutdown: CancellationToken) {
+async fn server_control_task(
+    sink: FrameSink,
+    inflight: PingInflight,
+    rtt: Arc<StdMutex<RttEstimator>>,
+    controller: Arc<StdMutex<WindowController>>,
+    bytes_sent: Arc<AtomicU64>,
+    pacing_rate: Arc<AtomicU64>,
+    shutdown: CancellationToken,
+) {
     let mut interval = tokio::time::interval(PING_INTERVAL);
     let mut next_nonce: u64 = 0;
     loop {
@@ -445,6 +490,10 @@ async fn server_ping_task(sink: FrameSink, inflight: PingInflight, shutdown: Can
         if !sink.send(TunnelFrame::Ping { nonce }).await {
             break;
         }
+        // Step the controller from the freshest RTT estimate (fed by prior
+        // probes' `Pong`s) and update the writer's pacing rate — the same
+        // shared `pacing_rate` cell the writer re-reads per frame.
+        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
     }
 }
 
@@ -461,6 +510,7 @@ async fn handle_tcp_stream(
     to_dest_rx: mpsc::Receiver<PeerToDest>,
     send_credit: SendCredit,
     idle: IdleGuard,
+    bytes_sent: Arc<AtomicU64>,
     token: CancellationToken,
 ) {
     let result = open_and_pump(
@@ -472,6 +522,7 @@ async fn handle_tcp_stream(
         to_dest_rx,
         &send_credit,
         &idle,
+        &bytes_sent,
         &token,
     )
     .await;
@@ -500,6 +551,7 @@ async fn open_and_pump(
     mut to_dest_rx: mpsc::Receiver<PeerToDest>,
     send_credit: &SendCredit,
     idle: &IdleGuard,
+    bytes_sent: &AtomicU64,
     token: &CancellationToken,
 ) -> Result<(), TunnelErrorCode> {
     let destination = parse_destination(&host, port);
@@ -598,6 +650,9 @@ async fn open_and_pump(
                     break;
                 }
                 idle.poke();
+                // Count dest→peer payload for the control task's utilization
+                // signal (drives the carrier's `WindowController`).
+                bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                 if !sink
                     .send(TunnelFrame::TcpData {
                         stream_id,

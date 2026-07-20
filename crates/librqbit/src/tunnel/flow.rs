@@ -19,6 +19,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, Semaphore};
@@ -277,6 +279,58 @@ impl WindowController {
 impl Default for WindowController {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Per-carrier control loop (the actuator wiring) ──────────────────────────
+//
+// One control-loop iteration, shared verbatim by the client mux's ping task and
+// the server relay's ping task so both carriers adapt identically. Called once
+// per RTT probe, AFTER the reader has had a chance to record the prior probe's
+// `Pong` sample into `rtt`. It reads the freshest queuing-delay estimate, steps
+// the `WindowController`, and drives the writer's pacing rate to `target / rtt`
+// (bytes/s) — the actuator that bounds in-flight data at ≈`target`, keeping
+// self-inflicted queuing delay low while letting throughput rise as the
+// controller grows `target` on a clear path.
+
+/// Step `controller` from the carrier's freshest queuing delay and whether it
+/// moved any data since the last tick (`bytes_sent` delta > 0 — read-and-reset
+/// here), then store `target / rtt_smooth` (bytes/s) into `pacing_rate` for the
+/// writer to pick up on its next frame.
+///
+/// Guards `rtt_smooth == 0` (no sample yet — leaves `pacing_rate` at its
+/// effectively-unlimited default so the writer never throttles before it can
+/// measure the path) and floors the computed rate at `config::MIN_PACING_RATE`.
+pub(crate) fn drive_flow_control(
+    rtt: &StdMutex<RttEstimator>,
+    controller: &StdMutex<WindowController>,
+    bytes_sent: &AtomicU64,
+    pacing_rate: &AtomicU64,
+) {
+    let (queuing_delay, rtt_smooth) = {
+        let est = rtt.lock().unwrap();
+        (est.queuing_delay(), est.rtt_smooth())
+    };
+    // Utilized = the carrier actually pushed data since the last tick. Gating
+    // growth on this stops an idle low-delay link from inflating `target`.
+    let utilized = bytes_sent.swap(0, Ordering::Relaxed) > 0;
+
+    let target = {
+        let mut ctl = controller.lock().unwrap();
+        ctl.step(queuing_delay, utilized);
+        ctl.target()
+    };
+
+    // bytes/s = target_bytes / rtt_seconds = target * 1e9 / rtt_nanos. Compute
+    // in u128 (unconditionally overflow-safe), and let `checked_div` also handle
+    // the "no RTT sample yet" guard: rtt_nanos == 0 yields `None`, so we leave
+    // `pacing_rate` at its effectively-unlimited default until the path is
+    // measured (the writer must not throttle before it can measure).
+    if let Some(rate) =
+        (target as u128 * 1_000_000_000u128).checked_div(rtt_smooth.as_nanos())
+    {
+        let rate = rate.clamp(config::MIN_PACING_RATE as u128, u64::MAX as u128) as u64;
+        pacing_rate.store(rate, Ordering::Relaxed);
     }
 }
 
@@ -659,6 +713,73 @@ mod tests {
             ctl.per_stream_window(0),
             ctl.per_stream_window(1),
             "0 active streams must not divide-by-zero and should behave like 1"
+        );
+    }
+
+    #[test]
+    fn drive_flow_control_grows_target_and_sets_pacing_from_target_over_rtt() {
+        use super::super::config::{MIN_TARGET, PACING_DEFAULT_RATE, TARGET_GROW_STEP};
+
+        let rtt = StdMutex::new(RttEstimator::new());
+        let controller = StdMutex::new(WindowController::new());
+        let bytes_sent = AtomicU64::new(0);
+        let pacing_rate = AtomicU64::new(PACING_DEFAULT_RATE);
+
+        // No RTT sample yet: pacing stays at the untouched default (the writer
+        // must not throttle before it can measure the path), and with no bytes
+        // moved the target holds at MIN_TARGET.
+        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
+        assert_eq!(pacing_rate.load(Ordering::Relaxed), PACING_DEFAULT_RATE);
+        assert_eq!(controller.lock().unwrap().target(), MIN_TARGET);
+
+        // Feed a low-delay 10ms RTT sample and register data moved since the
+        // last tick: the controller must grow one step and pacing must drop to
+        // the finite `target / rtt` value (well under the default cap).
+        rtt.lock().unwrap().record(Duration::from_millis(10));
+        bytes_sent.store(64 * 1024, Ordering::Relaxed);
+        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
+
+        assert_eq!(
+            controller.lock().unwrap().target(),
+            MIN_TARGET + TARGET_GROW_STEP,
+            "one utilized low-delay tick should grow the target by one step"
+        );
+        // bytes_sent must have been read-and-reset.
+        assert_eq!(bytes_sent.load(Ordering::Relaxed), 0);
+
+        let rate = pacing_rate.load(Ordering::Relaxed);
+        assert_ne!(
+            rate, PACING_DEFAULT_RATE,
+            "pacing rate must have been driven off the default cap"
+        );
+        // target = MIN_TARGET + one step, rtt = 10ms → rate = target * 100.
+        let target = (MIN_TARGET + TARGET_GROW_STEP) as u64;
+        assert_eq!(
+            rate,
+            target * 100,
+            "rate must equal target_bytes / rtt_seconds (10ms → ×100)"
+        );
+    }
+
+    #[test]
+    fn drive_flow_control_floors_pacing_rate() {
+        use super::super::config::MIN_PACING_RATE;
+
+        let rtt = StdMutex::new(RttEstimator::new());
+        let controller = StdMutex::new(WindowController::new());
+        let bytes_sent = AtomicU64::new(0);
+        let pacing_rate = AtomicU64::new(0);
+
+        // A huge RTT over the floor-level (MIN_TARGET) target would compute a
+        // sub-floor rate; the clamp must hold it at MIN_PACING_RATE so the
+        // writer never stalls to ~0.
+        rtt.lock().unwrap().record(Duration::from_secs(100));
+        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
+
+        assert_eq!(
+            pacing_rate.load(Ordering::Relaxed),
+            MIN_PACING_RATE,
+            "a tiny target over a huge RTT must floor at MIN_PACING_RATE, not stall"
         );
     }
 

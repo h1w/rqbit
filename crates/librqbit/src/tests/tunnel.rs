@@ -974,6 +974,162 @@ async fn client_mux_rtt_estimator_becomes_live_via_ping_pong() {
     token.cancel();
 }
 
+// ── Controller-driven adaptive window + pacing (Task E liveness) ────────────
+
+/// The payoff wiring test. The tunnel module's `#![allow(dead_code,
+/// unused_variables)]` means a controller that's stepped-but-whose-output-never-
+/// reaches-the-actuators, or a `pacing_rate` written to a cell the writer never
+/// reads, compiles clean and silently no-ops. This proves the loop is LIVE
+/// end-to-end: it mirrors the RTT-liveness harness (`build_real_relay_pair` +
+/// `ClientMux::new` + `run_server_relay` — a real Noise-encrypted client/server
+/// pair) and runs a SUSTAINED bulk transfer through one stream to a DRAINING
+/// loopback sink. On lossless loopback queuing delay stays below `LOW`, so with
+/// data actually moving the control task must (a) grow the controller's target
+/// off `MIN_TARGET` and (b) drive the SHARED `pacing_rate` cell — the exact
+/// `Arc` the writer re-reads per frame — off `PACING_DEFAULT_RATE` to
+/// `target / rtt`; and (c) a stream opened after the target grows must be
+/// seeded with a controller-derived window larger than the fixed default.
+#[tokio::test]
+async fn controller_drives_adaptive_window_and_pacing_live() {
+    use crate::tunnel::client_mux::{ClientMux, InboundTcp};
+    use crate::tunnel::config::{DEFAULT_WINDOW, MIN_TARGET, PACING_DEFAULT_RATE};
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    // Draining loopback sink: read and discard forever, so the server keeps
+    // granting the client credit and the transfer stays sustained (a
+    // non-draining "hold" sink would stall once one window + socket buffers
+    // fill, starving the utilization signal the controller needs).
+    let sink = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let sink_addr = sink.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = sink.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+
+    let mux = ClientMux::new(client, token.clone());
+
+    // Before any data moves or any RTT sample lands, the controller sits at its
+    // floor and the SHARED pacing cell holds the untouched default.
+    assert_eq!(mux.controller_target_for_test(), MIN_TARGET);
+    assert_eq!(mux.pacing_rate_for_test(), PACING_DEFAULT_RATE);
+
+    let (stream_id, mut inbound, credit) = mux
+        .open_tcp(TunnelDestination::Ip(sink_addr))
+        .await
+        .expect("open_tcp");
+    match inbound.recv().await {
+        Some(InboundTcp::Opened(_)) => {}
+        _ => panic!("expected TcpOpened verdict, stream was not established"),
+    }
+    // The first stream opened at MIN_TARGET / 1 stream, clamped — equal to the
+    // fixed default here, which is exactly why it can't yet prove derivation;
+    // the post-growth stream below does.
+    assert_eq!(mux.last_open_window_for_test(), DEFAULT_WINDOW);
+
+    // Continuously pump data through the stream, respecting flow-control credit,
+    // until the test cancels the token.
+    let pump_token = token.clone();
+    let send_mux = mux.clone();
+    let pump = tokio::spawn(async move {
+        const CHUNK: usize = 16 * 1024;
+        let chunk = Bytes::from(vec![0u8; CHUNK]);
+        loop {
+            if pump_token.is_cancelled() {
+                break;
+            }
+            let reserved = tokio::select! {
+                _ = pump_token.cancelled() => false,
+                ok = credit.reserve(CHUNK) => ok,
+            };
+            if !reserved {
+                break;
+            }
+            if !send_mux.send_tcp_data(stream_id, chunk.clone()).await {
+                break;
+            }
+        }
+    });
+
+    // Wait until the control task has driven BOTH actuators. Gating on both is
+    // deliberate: the controller grows `target` as soon as data moves at low
+    // delay (queuing delay is 0 < LOW even before the first RTT sample lands),
+    // but `pacing_rate` is only driven once `rtt_smooth > 0` — so a target-only
+    // wait can win the race before the first Pong is recorded. Both settle
+    // within a couple of 1s ping ticks under sustained load.
+    crate::tests::test_util::wait_until(
+        || {
+            let target = mux.controller_target_for_test();
+            let rate = mux.pacing_rate_for_test();
+            if target > MIN_TARGET && rate != PACING_DEFAULT_RATE {
+                Ok(())
+            } else {
+                anyhow::bail!("target={target} (MIN={MIN_TARGET}), pacing_rate={rate}")
+            }
+        },
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("control task should grow target AND drive pacing_rate under sustained low-delay load");
+
+    // (a)+(b) confirm the actuators the wait gated on.
+    assert!(
+        mux.controller_target_for_test() > MIN_TARGET,
+        "controller target must have grown off MIN_TARGET"
+    );
+    let rate = mux.pacing_rate_for_test();
+    assert_ne!(
+        rate, PACING_DEFAULT_RATE,
+        "pacing_rate (the SHARED cell the writer re-reads) must have been driven \
+         off the default to target/rtt by the control loop"
+    );
+    assert!(rate > 0, "pacing_rate must stay positive, got {rate}");
+
+    // (c) A stream opened now (target already grown) must be seeded from the
+    // controller — a window strictly larger than the fixed default, which the
+    // old `SendCredit::new()` seam could never produce.
+    let grown_target = mux.controller_target_for_test();
+    let (_sid2, _rx2, _cr2) = mux
+        .open_tcp(TunnelDestination::Ip(sink_addr))
+        .await
+        .expect("open second stream");
+    let win2 = mux.last_open_window_for_test();
+    assert!(
+        win2 > DEFAULT_WINDOW,
+        "second stream should seed a controller-derived window > default \
+         (target grown to {grown_target}, got window {win2})"
+    );
+
+    token.cancel();
+    let _ = pump.await;
+}
+
 // ── CarrierPool live-pool distribution + carrier-loss coverage ─────────────
 //
 // `pool_spawns_requested_carrier_count` in `client_pool.rs` never yields to

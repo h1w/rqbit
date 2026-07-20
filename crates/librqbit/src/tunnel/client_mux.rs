@@ -27,7 +27,9 @@ use tokio_util::sync::CancellationToken;
 use super::client::TunnelClient;
 use super::config::{PACING_DEFAULT_RATE, PER_CONN_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP};
 use super::crypto::NoiseTransport;
-use super::flow::{RttEstimator, SendCredit, record_ping_sent};
+use super::flow::{
+    RttEstimator, SendCredit, WindowController, drive_flow_control, record_ping_sent,
+};
 use super::frame::{TunnelDestination, TunnelErrorCode, TunnelFrame};
 use super::relay::{FrameSink, read_encrypted_frame, spawn_frame_writer};
 
@@ -70,9 +72,24 @@ pub(crate) struct ClientMux {
     shutdown: CancellationToken,
     /// Count of currently-registered TCP streams + UDP associations.
     load: Arc<AtomicUsize>,
-    /// Per-carrier RTT estimate fed by `Ping`/`Pong` round trips: `ping_task`
-    /// sends probes, `reader_loop`'s `Pong` arm records the samples.
+    /// Per-carrier RTT estimate fed by `Ping`/`Pong` round trips: the control
+    /// task sends probes, `reader_loop`'s `Pong` arm records the samples.
     rtt: Arc<StdMutex<RttEstimator>>,
+    /// Delay-adaptive in-flight controller. The control task steps it from the
+    /// carrier's queuing delay; `open_tcp` seeds each new stream's send window
+    /// from `per_stream_window(load)`.
+    controller: Arc<StdMutex<WindowController>>,
+    /// Local→tunnel bytes sent since the control task last read it (utilization
+    /// signal, read-and-reset each tick). Incremented in `send_tcp_data`.
+    bytes_sent: Arc<AtomicU64>,
+    /// The writer's pacing-rate cell (bytes/s). The SAME `Arc` is handed to
+    /// `spawn_frame_writer` (which re-reads it per frame) and the control task
+    /// (which drives it to `target / rtt`); kept here for the test accessor.
+    pacing_rate: Arc<AtomicU64>,
+    /// Test-only: the window (bytes) the most recent `open_tcp` seeded its
+    /// `SendCredit` with, so a test can prove the seed is controller-derived.
+    #[cfg(test)]
+    last_open_window: Arc<AtomicUsize>,
 }
 
 impl ClientMux {
@@ -80,17 +97,24 @@ impl ClientMux {
     pub(crate) fn new(client: TunnelClient, shutdown: CancellationToken) -> Arc<Self> {
         let (transport, reader, writer) = client.into_split();
         let transport = Arc::new(Mutex::new(transport));
-        // Phase A: seed at the effectively-unlimited default; a later
-        // controller task (Task E) can update this cell live to pace the
-        // connection.
+        // ONE pacing-rate cell shared by the writer (which re-reads it per
+        // frame) and the control task below (which drives it to `target / rtt`).
+        // Seeded at the effectively-unlimited default until the first RTT
+        // sample lands.
         let pacing_rate = Arc::new(AtomicU64::new(PACING_DEFAULT_RATE));
-        let (sink, _writer_handle) =
-            spawn_frame_writer(transport.clone(), writer, shutdown.clone(), pacing_rate);
+        let (sink, _writer_handle) = spawn_frame_writer(
+            transport.clone(),
+            writer,
+            shutdown.clone(),
+            pacing_rate.clone(),
+        );
 
         let tcp: TcpRoutes = Arc::new(Mutex::new(HashMap::new()));
         let udp: UdpRoutes = Arc::new(Mutex::new(HashMap::new()));
         let load = Arc::new(AtomicUsize::new(0));
         let rtt = Arc::new(StdMutex::new(RttEstimator::new()));
+        let controller = Arc::new(StdMutex::new(WindowController::new()));
+        let bytes_sent = Arc::new(AtomicU64::new(0));
         let ping_inflight: PingInflight = Arc::new(StdMutex::new(HashMap::new()));
 
         let mux = Arc::new(Self {
@@ -103,6 +127,11 @@ impl ClientMux {
             shutdown: shutdown.clone(),
             load: load.clone(),
             rtt: rtt.clone(),
+            controller: controller.clone(),
+            bytes_sent: bytes_sent.clone(),
+            pacing_rate: pacing_rate.clone(),
+            #[cfg(test)]
+            last_open_window: Arc::new(AtomicUsize::new(0)),
         });
 
         tokio::spawn(reader_loop(
@@ -111,12 +140,20 @@ impl ClientMux {
             tcp,
             udp,
             load,
-            rtt,
+            rtt.clone(),
             ping_inflight.clone(),
             sink.clone(),
             shutdown.clone(),
         ));
-        tokio::spawn(ping_task(sink, ping_inflight, shutdown));
+        tokio::spawn(ping_and_control_task(
+            sink,
+            ping_inflight,
+            rtt,
+            controller,
+            bytes_sent,
+            pacing_rate,
+            shutdown,
+        ));
 
         mux
     }
@@ -134,7 +171,13 @@ impl ClientMux {
     ) -> Option<(u64, mpsc::Receiver<InboundTcp>, SendCredit)> {
         let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(PER_CONN_QUEUE);
-        let send_credit = SendCredit::new();
+        // Seed the local→tunnel send window from the carrier's controller,
+        // split across the streams already open (this one isn't registered
+        // yet, so `load()` is the pre-existing count).
+        let window = self.controller.lock().unwrap().per_stream_window(self.load());
+        #[cfg(test)]
+        self.last_open_window.store(window, Ordering::Relaxed);
+        let send_credit = SendCredit::with_window(window);
         self.tcp.lock().await.insert(
             stream_id,
             TcpRoute {
@@ -165,6 +208,10 @@ impl ClientMux {
     }
 
     pub(crate) async fn send_tcp_data(&self, stream_id: u64, bytes: Bytes) -> bool {
+        // Count local→tunnel payload for the control task's utilization signal
+        // (drives the carrier's `WindowController`).
+        self.bytes_sent
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.sink
             .send(TunnelFrame::TcpData { stream_id, bytes })
             .await
@@ -254,13 +301,46 @@ impl ClientMux {
         let est = self.rtt.lock().unwrap();
         (est.rtt_min(), est.rtt_smooth())
     }
+
+    /// Current controller in-flight target (bytes). Test-only accessor proving
+    /// the control task actually steps the `WindowController`.
+    #[cfg(test)]
+    pub(crate) fn controller_target_for_test(&self) -> usize {
+        self.controller.lock().unwrap().target()
+    }
+
+    /// Current value of the SHARED pacing-rate cell (bytes/s) — the exact cell
+    /// `spawn_frame_writer` re-reads per frame. Test-only accessor proving the
+    /// control task drove it off `PACING_DEFAULT_RATE` to `target / rtt`.
+    #[cfg(test)]
+    pub(crate) fn pacing_rate_for_test(&self) -> u64 {
+        self.pacing_rate.load(Ordering::Relaxed)
+    }
+
+    /// The window (bytes) the most recent `open_tcp` seeded its `SendCredit`
+    /// with. Test-only accessor proving new streams open with a
+    /// controller-derived window (not the fixed default).
+    #[cfg(test)]
+    pub(crate) fn last_open_window_for_test(&self) -> usize {
+        self.last_open_window.load(Ordering::Relaxed)
+    }
 }
 
-/// Periodic RTT probe: every `PING_INTERVAL`, send a `Ping` carrying a
-/// monotonically increasing nonce and remember its send time, so
-/// `reader_loop`'s `Pong` arm can turn the round trip into an RTT sample.
-/// Stops on shutdown, or once the sink is gone (peer disconnected).
-async fn ping_task(sink: FrameSink, inflight: PingInflight, shutdown: CancellationToken) {
+/// Periodic RTT probe + per-carrier control loop. Every `PING_INTERVAL`: send a
+/// `Ping` carrying a monotonically increasing nonce and remember its send time
+/// (so `reader_loop`'s `Pong` arm turns the round trip into an RTT sample),
+/// then step the `WindowController` from the freshest sample and drive the
+/// writer's pacing rate to `target / rtt` via `drive_flow_control`. Stops on
+/// shutdown, or once the sink is gone (peer disconnected).
+async fn ping_and_control_task(
+    sink: FrameSink,
+    inflight: PingInflight,
+    rtt: Arc<StdMutex<RttEstimator>>,
+    controller: Arc<StdMutex<WindowController>>,
+    bytes_sent: Arc<AtomicU64>,
+    pacing_rate: Arc<AtomicU64>,
+    shutdown: CancellationToken,
+) {
     let mut interval = tokio::time::interval(PING_INTERVAL);
     let mut next_nonce: u64 = 0;
     loop {
@@ -277,6 +357,10 @@ async fn ping_task(sink: FrameSink, inflight: PingInflight, shutdown: Cancellati
         if !sink.send(TunnelFrame::Ping { nonce }).await {
             break;
         }
+        // Step the controller from the freshest RTT estimate (fed by prior
+        // probes' `Pong`s) and update the writer's pacing rate — the same
+        // shared `pacing_rate` cell the writer re-reads per frame.
+        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
     }
 }
 
