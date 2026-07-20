@@ -87,8 +87,17 @@ rqbit --socks-url socks5://[username:password]@host:port ...
 
 rqbit can operate as an **encrypted TCP tunnel** between a desktop client behind
 NAT and a reachable VPS server. The tunnel uses a private BitTorrent v2 (BEP 52)
-carrier — the BitTorrent peer-wire between client and server looks like a
-legitimate torrent swarm to any observer.
+carrier keyed by a real per-server torrent info-hash — at the protocol level the
+connection looks like an encrypted (MSE/PE) BitTorrent peer connection.
+
+> **Quickstart:** it's one binary; server and client differ only by flags. See
+> [`scripts/tunnel/`](scripts/tunnel/README.md) — run `server-quickstart.sh` on
+> the VPS, then `client-run.sh` (or double-click `client-run.bat` on Windows) on
+> the desktop.
+
+> **Honest scope:** this blends at the *protocol* level. It does **not** disguise
+> traffic *shape* — a single long-lived, high-throughput connection to one IP
+> with no swarm/DHT is still distinguishable by traffic analysis.
 
 **Encryption layers:**
 1. **Outer:** MSE/PE (Message Stream Encryption / Protocol Encryption) —
@@ -106,14 +115,14 @@ No DHT, tracker, or persistence state is used for the tunnel carrier.
 
 ### Key generation
 
-Use the included key generation script:
+The binary generates the keypairs (no dependencies):
 
 ```bash
-pip install cryptography
-python3 scripts/rqbit-tunnel-keygen.py --output-dir ~/.rqbit/tunnel-keys
+rqbit tunnel keygen --output-dir ~/.rqbit/tunnel-keys
 ```
 
-This produces:
+No pairing bundle is needed — the carrier identity is derived from the server
+key on both sides. This produces:
 
 | File | Permissions | Purpose |
 |------|------------|---------|
