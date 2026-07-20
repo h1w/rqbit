@@ -80,6 +80,8 @@ parking_lot.workspace = true
 tracing.workspace = true
 size_format.workspace = true
 rand.workspace = true
+sha2.workspace = true
+curve25519-dalek.workspace = true
 tracing-subscriber = { workspace = true, features = ["json", "fmt", "env-filter"], optional = true }
 uuid = { workspace = true, features = ["v4"] }
 futures.workspace = true
@@ -110,7 +112,11 @@ axum-extra = { workspace = true, features = ["query"] }
 librqbit-dualstack-sockets = { workspace = true, features = ["axum"] }
 socket2.workspace = true
 nix = { workspace = true, features = ["uio"] }
+num-bigint.workspace = true
+rc4.workspace = true
 thiserror.workspace = true
+snow.workspace = true
+fast-socks5.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }

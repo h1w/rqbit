@@ -83,6 +83,113 @@ eval "$(rqbit completions bash)"
 rqbit --socks-url socks5://[username:password]@host:port ...
 ```
 
+## Tunnel mode
+
+rqbit can operate as an **encrypted TCP tunnel** between a desktop client behind
+NAT and a reachable VPS server. The tunnel uses a private BitTorrent v2 (BEP 52)
+carrier keyed by a real per-server torrent info-hash — at the protocol level the
+connection looks like an encrypted (MSE/PE) BitTorrent peer connection.
+
+> **Quickstart:** it's one binary; server and client differ only by flags. See
+> [`scripts/tunnel/`](scripts/tunnel/README.md) — run `server-quickstart.sh` on
+> the VPS, then `client-run.sh` (or double-click `client-run.bat` on Windows) on
+> the desktop.
+
+> **Honest scope:** this blends at the *protocol* level. It does **not** disguise
+> traffic *shape* — a single long-lived, high-throughput connection to one IP
+> with no swarm/DHT is still distinguishable by traffic analysis.
+
+**Encryption layers:**
+1. **Outer:** MSE/PE (Message Stream Encryption / Protocol Encryption) —
+   standard BitTorrent peer-wire obfuscation.
+2. **Inner:** Noise IK (Curve25519 + ChaChaPoly) — static-key authenticated
+   encryption of every tunnel frame.
+
+**Traffic flow:**
+- Local applications (browser, curl, etc.) **→** client loopback SOCKS5 (`127.0.0.1:1080`).
+- **Client → VPS:** encrypted carrier leg (Noise frames inside BitTorrent peer-wire).
+- **VPS → destination:** normal TCP (the VPS egresses requests to the target host).
+
+The server allowlists client public keys — only authorized clients may connect.
+No DHT, tracker, or persistence state is used for the tunnel carrier.
+
+### Key generation
+
+The binary generates the keypairs (no dependencies):
+
+```bash
+rqbit tunnel keygen --output-dir ~/.rqbit/tunnel-keys
+```
+
+No pairing bundle is needed — the carrier identity is derived from the server
+key on both sides. This produces:
+
+| File | Permissions | Purpose |
+|------|------------|---------|
+| `client.key` | `600` (secret) | Client x25519 private key |
+| `client.pub` | `644` (public) | Client x25519 public key |
+| `server.key` | `600` (secret) | Server x25519 private key |
+| `server.pub` | `644` (public) | Server x25519 public key |
+
+Keys are 32-byte hex-encoded values (64 hex characters).
+
+**Security:** Never share `.key` files. Only `.pub` files should be exchanged
+between client and server operators.
+
+### VPS server
+
+```bash
+# Create allowed-clients file with the client's public key
+echo "CLIENT_PUB_HEX" > /etc/rqbit/allowed-clients.txt
+
+rqbit server start /data \
+  --tunnel-mode server \
+  --tunnel-peer-listen 0.0.0.0:4242 \
+  --tunnel-server-key /etc/rqbit/server.key \
+  --tunnel-allowed-clients /etc/rqbit/allowed-clients.txt \
+  --tunnel-carrier-root /var/lib/rqbit/tunnel
+```
+
+### Desktop client
+
+```bash
+rqbit server start /data \
+  --tunnel-mode client \
+  --tunnel-socks-listen 127.0.0.1:1080 \
+  --tunnel-server-addr vps.example.com:4242 \
+  --tunnel-client-key ~/.rqbit/client.key \
+  --tunnel-server-key ~/.rqbit/server.pub
+```
+
+### Using the tunnel
+
+Point any SOCKS5-compatible application at `127.0.0.1:1080`:
+
+```bash
+# curl
+curl --socks5 127.0.0.1:1080 https://checkip.amazonaws.com
+# → shows your VPS IP
+
+# Firefox: Settings → Network Settings → SOCKS Host: 127.0.0.1, Port: 1080, SOCKS v5
+```
+
+### Environment variables
+
+Every `--tunnel-*` flag has a corresponding `RQBIT_TUNNEL_*` environment variable:
+
+| Flag | Environment variable |
+|------|---------------------|
+| `--tunnel-mode` | `RQBIT_TUNNEL_MODE` |
+| `--tunnel-socks-listen` | `RQBIT_TUNNEL_SOCKS_LISTEN` |
+| `--tunnel-server-addr` | `RQBIT_TUNNEL_SERVER_ADDR` |
+| `--tunnel-peer-listen` | `RQBIT_TUNNEL_PEER_LISTEN` |
+| `--tunnel-client-key` | `RQBIT_TUNNEL_CLIENT_KEY` |
+| `--tunnel-server-key` | `RQBIT_TUNNEL_SERVER_KEY` |
+| `--tunnel-allowed-clients` | `RQBIT_TUNNEL_ALLOWED_CLIENTS` |
+| `--tunnel-pairing` | `RQBIT_TUNNEL_PAIRING` |
+| `--tunnel-carrier-root` | `RQBIT_TUNNEL_CARRIER_ROOT` |
+| `--tunnel-egress-policy` | `RQBIT_TUNNEL_EGRESS_POLICY` |
+
 ## Watching a directory for .torrents
 
 ```

@@ -75,6 +75,7 @@ mod stream_connect;
 mod torrent_state;
 #[cfg(feature = "tracing-subscriber-utils")]
 pub mod tracing_subscriber_config_utils;
+mod tunnel;
 mod type_aliases;
 #[cfg(all(feature = "http-api", feature = "upnp-serve-adapter"))]
 pub mod upnp_server_adapter;
@@ -107,6 +108,10 @@ pub use clone_to_owned::CloneToOwned;
 pub use librqbit_core::magnet::*;
 pub use librqbit_core::peer_id::*;
 pub use librqbit_core::torrent_metainfo::*;
+
+pub use tunnel::crypto::generate_keypair as tunnel_generate_keypair;
+pub use tunnel::frame::{TunnelPairingBundle, TunnelPrivateKey, TunnelPublicKey};
+pub use tunnel::options::{EgressPolicy, TunnelClientOptions, TunnelOptions, TunnelServerOptions};
 
 #[cfg(test)]
 mod tests;
