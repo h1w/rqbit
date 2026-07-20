@@ -73,30 +73,140 @@ pub(crate) async fn read_encrypted_frame<R: AsyncRead + Unpin>(
 }
 
 /// Cloneable handle for submitting frames to the single writer task.
+///
+/// Outbound frames are split across TWO channels drained by the same writer:
+///   * a **control** priority lane for the order-independent frames, and
+///   * an ordered **data** lane for stream bytes and their close/reset markers.
+///
+/// The writer's `biased` select always services the control lane first, so a
+/// `Ping`/`Pong`/`Credit` is never stuck behind a `TcpData` frame that is
+/// asleep on its pacing deadline. Without this split, control frames share the
+/// one FIFO with paced data: under sustained load the measured RTT self-inflates
+/// (control queues behind seconds of paced data), the `WindowController` reads a
+/// huge queuing delay, and pacing locks at `MIN_TARGET` forever.
+///
+/// See [`FrameSink::is_data`] for the exact per-variant routing and why
+/// `TcpFin`/`TcpReset` ride the ordered data lane rather than preempting.
 #[derive(Clone)]
 pub(crate) struct FrameSink {
-    tx: mpsc::Sender<TunnelFrame>,
+    /// Priority lane: `Ping`/`Pong`/`Credit` + lifecycle frames. Never paced.
+    control_tx: mpsc::Sender<TunnelFrame>,
+    /// Ordered lane: `TcpData` (paced) + `TcpFin`/`TcpReset`/`UdpDatagram`
+    /// (unpaced). FIFO so a stream's close never overtakes its own data.
+    data_tx: mpsc::Sender<TunnelFrame>,
 }
 
 impl FrameSink {
+    /// Routing table (the ONLY place a frame is classified). Returns `true` for
+    /// the ordered data lane, `false` for the control priority lane.
+    ///
+    /// The lane split is NOT simply "control vs data" — it is "must stay ordered
+    /// behind this stream's `TcpData`" vs "order-independent, safe to preempt":
+    ///
+    ///   * Data lane (FIFO, so per-stream order is preserved): `TcpData` (the
+    ///     only PACED frame), and `TcpFin`/`TcpReset` — a graceful half-close or
+    ///     reset is logically part of the stream's byte sequence and is emitted
+    ///     AFTER that stream's data, so it must never overtake still-pending
+    ///     paced `TcpData` (doing so truncates the stream at the receiver).
+    ///     `UdpDatagram` also rides here: it needs no ordering, but must stay
+    ///     OFF the control lane so a UDP flood can't crowd out `Ping`/`Credit`.
+    ///
+    ///   * Control priority lane (unpaced, `biased`-preempts data): `Ping`,
+    ///     `Pong`, `Credit` — the RTT + flow-control frames whose queuing behind
+    ///     paced data is the exact bug this split fixes — plus the lifecycle
+    ///     frames (`OpenTcp`, `TcpOpened`, `OpenUdp`, `CloseUdp`,
+    ///     `ClientHello`, `ServerHello`) which are order-independent of any
+    ///     in-flight `TcpData` (an open/hello always precedes its stream's data;
+    ///     a UDP close racing a trailing lossy datagram is harmless).
+    ///
+    /// (This intentionally deviates from the original task's routing table,
+    /// which listed `TcpFin`/`TcpReset` on the control lane — that reordering
+    /// truncates streams and is caught by
+    /// `real_relay_transfers_large_payload_with_flow_control`.)
+    ///
+    /// Written as an EXHAUSTIVE match with no `_` arm ON PURPOSE: the module's
+    /// blanket `#![allow(dead_code, unused_variables)]` will not flag a
+    /// mis-routed frame, but a non-exhaustive match is a hard error regardless
+    /// of any `allow`, so adding a new `TunnelFrame` variant forces a routing
+    /// decision here at compile time. Mis-routing is the whole bug class this
+    /// fix guards against: bulk data on the control lane bypasses pacing
+    /// (bufferbloat returns); a control frame on the data lane gets paced (the
+    /// self-inflated-RTT bug).
+    fn is_data(frame: &TunnelFrame) -> bool {
+        match frame {
+            // Ordered data lane.
+            TunnelFrame::TcpData { .. }
+            | TunnelFrame::TcpFin { .. }
+            | TunnelFrame::TcpReset { .. }
+            | TunnelFrame::UdpDatagram { .. } => true,
+            // Control priority lane.
+            TunnelFrame::ClientHello(_)
+            | TunnelFrame::ServerHello(_)
+            | TunnelFrame::OpenTcp { .. }
+            | TunnelFrame::TcpOpened { .. }
+            | TunnelFrame::OpenUdp { .. }
+            | TunnelFrame::CloseUdp { .. }
+            | TunnelFrame::Credit { .. }
+            | TunnelFrame::Ping { .. }
+            | TunnelFrame::Pong { .. } => false,
+        }
+    }
+
     /// Enqueue a frame for encryption+write. Returns `false` if the writer task
-    /// has stopped (peer gone).
+    /// has stopped (peer gone). Routes by variant to the control or data lane.
     pub(crate) async fn send(&self, frame: TunnelFrame) -> bool {
-        self.tx.send(frame).await.is_ok()
+        let tx = if Self::is_data(&frame) {
+            &self.data_tx
+        } else {
+            &self.control_tx
+        };
+        tx.send(frame).await.is_ok()
     }
 
     /// Best-effort enqueue for lossy traffic (UDP datagrams). Drops the frame
-    /// if the shared outbound queue is full instead of blocking the caller —
-    /// which would head-of-line-block every other stream on this connection.
-    /// Returns `false` only if the peer connection is gone.
+    /// if the destination lane is full instead of blocking the caller — which
+    /// would head-of-line-block every other stream on this connection. Routes by
+    /// variant like `send`, so `UdpDatagram`s land on the data lane (they must
+    /// never flood the control priority lane). Returns `false` only if the peer
+    /// connection is gone.
     pub(crate) fn try_send_lossy(&self, frame: TunnelFrame) -> bool {
         use mpsc::error::TrySendError;
-        match self.tx.try_send(frame) {
+        let tx = if Self::is_data(&frame) {
+            &self.data_tx
+        } else {
+            &self.control_tx
+        };
+        match tx.try_send(frame) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => true, // dropped; connection still alive
             Err(TrySendError::Closed(_)) => false,
         }
     }
+}
+
+/// The on-wire ciphertext byte-length pacing budgets against for a `TcpData`
+/// frame, derived arithmetically so NOTHING is encrypted (or even allocated) on
+/// the hot path just to measure a length.
+///
+/// Encryption is deferred to write time so Noise's per-message sequence order
+/// stays == wire order: a `TcpData` frame pre-encrypted (consuming sequence N)
+/// and then held for pacing while a `Ping` (sequence N+1) jumps ahead of it on
+/// the wire would desync the peer's cipher. So the writer holds the PLAINTEXT
+/// frame while pending and can't read the real blob length early — it computes
+/// it here instead.
+///
+/// Mirrors `TunnelFrame::encode` + `NoiseTransport::encrypt` exactly:
+///   encoded = version(1) + type(1) + varint(stream_id) + u16 len(2) + payload
+///   cipher  = seq(8) + encoded + Poly1305 tag(16)
+/// i.e. `payload + 28 + varint_len(stream_id)`.
+fn tcp_data_wire_len(stream_id: u64, payload_len: usize) -> u64 {
+    let mut varint = 1u64;
+    let mut v = stream_id >> 7;
+    while v != 0 {
+        varint += 1;
+        v >>= 7;
+    }
+    payload_len as u64 + 28 + varint
 }
 
 /// Spawn the single writer task. It owns the write half and the shared
@@ -120,67 +230,158 @@ pub(crate) fn spawn_frame_writer(
     pacing_rate: Arc<AtomicU64>,
     paced: Arc<AtomicBool>,
 ) -> (FrameSink, JoinHandle<()>) {
-    let (tx, mut rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
+    // TWO lanes, one writer. `OUTBOUND_QUEUE` each: the control lane is a
+    // priority lane the writer's `biased` select always drains first, so
+    // `Ping`/`Pong`/`Credit` never wait behind a paced `TcpData` frame.
+    let (control_tx, mut control_rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
+    let (data_tx, mut data_rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
     let handle = tokio::spawn(async move {
         // Base instant for the pure `TokenBucket`'s injected clock — it never
         // calls `Instant::now()` itself, so it stays deterministically
         // testable.
         let base = Instant::now();
         let mut bucket = TokenBucket::new(pacing_rate.load(Ordering::Relaxed), PACING_BURST);
-        loop {
-            let frame = tokio::select! {
-                _ = shutdown.cancelled() => break,
-                f = rx.recv() => match f {
-                    Some(f) => f,
-                    None => break,
-                },
-            };
+
+        // Encrypt + write one frame in place. Encryption happens HERE (not when
+        // the frame is popped) so encrypt-order == wire-order: while a `TcpData`
+        // frame waits out its pacing deadline it stays plaintext in `pending`,
+        // and a control frame that preempts it is encrypted+written first with
+        // the earlier Noise sequence number — keeping the peer's cipher in sync.
+        // Returns `false` on any fatal error (encrypt/IO), signalling the loop
+        // to break.
+        async fn write_frame(
+            writer: &mut BoxAsyncWrite,
+            transport: &Mutex<NoiseTransport>,
+            frame: &TunnelFrame,
+        ) -> bool {
             let blob = {
                 let mut t = transport.lock().await;
-                match t.encrypt(&frame) {
+                match t.encrypt(frame) {
                     Ok(b) => b,
                     Err(e) => {
                         tracing::debug!(error = %e, "tunnel writer encrypt failed");
-                        break;
+                        return false;
                     }
                 }
             };
-
-            // Pace bulk `TcpData` frames ONLY. UDP is deliberately excluded:
-            // it's already best-effort/lossy (`try_send_lossy`), pacing it adds
-            // latency to real-time datagrams for no throughput benefit, and it
-            // stays out of the growth signal entirely. Pacing control frames
-            // would also break the very mechanisms pacing depends on: delaying a
-            // `Credit` stalls flow control, and delaying a `Ping`/`Pong`
-            // corrupts the RTT measurement that feeds the controller. So all
-            // control + UDP frames pass through with zero pacing delay.
-            //
-            // Pace on the encrypted blob's length (the wire-relevant size: the
-            // ciphertext actually written, excluding only the 2-byte length
-            // prefix). Re-read the rate each iteration so a live controller
-            // update takes effect on the very next frame. When a real pacing
-            // sleep occurs, raise the shared `paced` flag — this is the control
-            // loop's `utilized` signal ("pacing was the bottleneck").
-            if matches!(frame, TunnelFrame::TcpData { .. }) {
-                bucket.set_rate(pacing_rate.load(Ordering::Relaxed));
-                let now_nanos = base.elapsed().as_nanos() as u64;
-                let delay_nanos = bucket.take(now_nanos, blob.len() as u64);
-                if delay_nanos > 0 {
-                    paced.store(true, Ordering::Relaxed);
-                    tokio::time::sleep(Duration::from_nanos(delay_nanos)).await;
-                }
-            }
-
             let len = (blob.len() as u16).to_be_bytes();
-            if writer.write_all(&len).await.is_err()
+            !(writer.write_all(&len).await.is_err()
                 || writer.write_all(&blob).await.is_err()
-                || writer.flush().await.is_err()
-            {
+                || writer.flush().await.is_err())
+        }
+
+        // A data frame awaiting its pacing deadline (kept PLAINTEXT — see
+        // `write_frame`), and the instant it may be written.
+        let mut pending: Option<TunnelFrame> = None;
+        let mut deadline: Option<tokio::time::Instant> = None;
+        // Per-lane liveness. A closed channel's `recv()` is instantly ready with
+        // `None`, so once a lane closes we disable its arm via these flags
+        // (rather than letting it spin). Note the `else`/all-disabled fallback
+        // can't exit us here — the `shutdown` arm has an irrefutable pattern and
+        // is never disabled — so both-closed exit is an explicit top-of-loop
+        // check instead.
+        let mut control_open = true;
+        let mut data_open = true;
+
+        loop {
+            // Both lanes drained and closed, nothing left to flush: peer gone.
+            if !control_open && !data_open && pending.is_none() {
                 break;
+            }
+            tokio::select! {
+                // Priority order: shutdown, then the control lane, then a due
+                // pending data frame, then admitting a new data frame. `biased`
+                // is what makes the control lane preempt paced data: whenever a
+                // control frame is ready it is serviced before the pending
+                // data's deadline arm and before pulling more data.
+                biased;
+
+                _ = shutdown.cancelled() => break,
+
+                // Control priority lane — never paced, always first.
+                ctrl = control_rx.recv(), if control_open => match ctrl {
+                    Some(ctrl) => {
+                        if !write_frame(&mut writer, &transport, &ctrl).await {
+                            break;
+                        }
+                    }
+                    None => control_open = false,
+                },
+
+                // The pending data frame's pace deadline elapsed. `sleep_until`
+                // with an already-past deadline returns immediately, so a
+                // control frame that jumped ahead (advancing the loop) simply
+                // lets this fire on the next pass. Only armed while a frame is
+                // actually pending.
+                _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if pending.is_some() => {
+                    let frame = pending.take().unwrap();
+                    deadline = None;
+                    if !write_frame(&mut writer, &transport, &frame).await {
+                        break;
+                    }
+                }
+
+                // Admit the next bulk frame — but only while nothing is already
+                // pending, so a single in-flight pacing deadline is honored
+                // before we pull more.
+                data = data_rx.recv(), if data_open && pending.is_none() => {
+                    let data = match data {
+                        Some(data) => data,
+                        None => {
+                            data_open = false;
+                            continue;
+                        }
+                    };
+                    // Pace `TcpData` ONLY. `UdpDatagram`/`TcpFin`/`TcpReset` ride
+                    // the data lane (for ordering / to stay off the control
+                    // priority lane) but are never paced: pacing them adds
+                    // latency for no throughput benefit and they stay out of the
+                    // growth signal entirely.
+                    let pace_len = match &data {
+                        TunnelFrame::TcpData { stream_id, bytes } => {
+                            Some(tcp_data_wire_len(*stream_id, bytes.len()))
+                        }
+                        _ => None,
+                    };
+                    match pace_len {
+                        Some(pace_len) => {
+                            // Re-read the rate each frame so a live controller
+                            // update takes effect on the very next one.
+                            bucket.set_rate(pacing_rate.load(Ordering::Relaxed));
+                            let now_nanos = base.elapsed().as_nanos() as u64;
+                            let delay_nanos = bucket.take(now_nanos, pace_len);
+                            if delay_nanos == 0 {
+                                if !write_frame(&mut writer, &transport, &data).await {
+                                    break;
+                                }
+                            } else {
+                                // A real pacing delay: raise the shared `paced`
+                                // flag (the control loop's `utilized` signal —
+                                // "pacing was the bottleneck") and hold the
+                                // frame plaintext until its deadline.
+                                paced.store(true, Ordering::Relaxed);
+                                deadline =
+                                    Some(tokio::time::Instant::now() + Duration::from_nanos(delay_nanos));
+                                pending = Some(data);
+                            }
+                        }
+                        None => {
+                            if !write_frame(&mut writer, &transport, &data).await {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     });
-    (FrameSink { tx }, handle)
+    (
+        FrameSink {
+            control_tx,
+            data_tx,
+        },
+        handle,
+    )
 }
 
 // ── Destination helpers ─────────────────────────────────────────────────────
@@ -884,6 +1085,126 @@ mod tests {
         assert!(
             !paced.load(Ordering::Relaxed),
             "writer must NOT set `paced` when the default rate never throttles"
+        );
+    }
+
+    /// Regression guard for THE bug: control frames sharing the single FIFO with
+    /// paced data. At a low rate the tail of a burst of `TcpData` is held on a
+    /// pacing deadline; a `Ping` enqueued AFTER all of it must still jump ahead
+    /// on the wire (control priority lane) instead of coming out dead last as it
+    /// would in the old single-queue writer.
+    ///
+    /// Decrypting every frame in wire order with the peer's transport also
+    /// proves the writer preserved Noise's per-message sequence order == wire
+    /// order despite the reordering: a `TcpData` frame pre-encrypted and then
+    /// overtaken by the `Ping` would desync the cipher and fail to decrypt here.
+    #[tokio::test]
+    async fn control_frames_preempt_paced_data() {
+        const PAYLOAD: usize = 16 * 1024; // matches READ_CHUNK
+        const N_DATA: usize = 18; // > PACING_BURST (256 KiB) so the tail paces
+        const LOW_RATE: u64 = 64 * 1024; // 64 KiB/s
+
+        let (client_transport, mut server_transport) = handshake_pair();
+        let (write_half, mut read_half) = tokio::io::duplex(8 * 1024 * 1024);
+        let shutdown = CancellationToken::new();
+        let pacing_rate = Arc::new(AtomicU64::new(LOW_RATE));
+        let paced = Arc::new(AtomicBool::new(false));
+        let (sink, _handle) = spawn_frame_writer(
+            Arc::new(Mutex::new(client_transport)),
+            Box::new(write_half),
+            shutdown.clone(),
+            pacing_rate,
+            paced.clone(),
+        );
+
+        // A burst of bulk data (the tail of which the writer WILL pace), then a
+        // single control `Ping` enqueued after all of it. In the old
+        // single-FIFO writer the `Ping` would sit behind every paced `TcpData`
+        // and be written LAST.
+        for _ in 0..N_DATA {
+            let ok = sink
+                .send(TunnelFrame::TcpData {
+                    stream_id: 1,
+                    bytes: Bytes::from(vec![0u8; PAYLOAD]),
+                })
+                .await;
+            assert!(ok, "data frame should be accepted");
+        }
+        assert!(
+            sink.send(TunnelFrame::Ping { nonce: 42 }).await,
+            "ping should be accepted"
+        );
+
+        // Read + decrypt every frame in wire order.
+        let mut frames = Vec::with_capacity(N_DATA + 1);
+        for _ in 0..(N_DATA + 1) {
+            let mut len_buf = [0u8; 2];
+            read_half.read_exact(&mut len_buf).await.unwrap();
+            let len = u16::from_be_bytes(len_buf) as usize;
+            let mut blob = vec![0u8; len];
+            read_half.read_exact(&mut blob).await.unwrap();
+            frames.push(
+                server_transport
+                    .decrypt(&blob)
+                    .expect("wire order must equal Noise sequence order"),
+            );
+        }
+        shutdown.cancel();
+
+        let data_count = frames
+            .iter()
+            .filter(|f| matches!(f, TunnelFrame::TcpData { .. }))
+            .count();
+        assert_eq!(
+            data_count, N_DATA,
+            "no data frame may be dropped or duplicated"
+        );
+
+        let ping_pos = frames
+            .iter()
+            .position(|f| matches!(f, TunnelFrame::Ping { nonce: 42 }))
+            .expect("the ping must be written");
+
+        // The decisive assertion: the ping is NOT the last frame. At least one
+        // still-pending paced `TcpData` follows it, i.e. control preempted data.
+        // In the buggy single-queue writer the ping would be at index N_DATA
+        // (dead last).
+        assert!(
+            ping_pos < frames.len() - 1,
+            "control ping must preempt still-pending paced data; instead it came \
+             out at index {ping_pos} of {} — control is queued behind paced data \
+             (the self-inflated-RTT bug)",
+            frames.len()
+        );
+    }
+
+    /// Dropping every `FrameSink` clone closes BOTH lanes; the writer must then
+    /// exit on its own, WITHOUT the shutdown token firing. (The `biased` select
+    /// keeps a never-disabled `shutdown` arm, so both-closed exit can't fall out
+    /// of an `else`/all-disabled path — it's an explicit check that this guards.)
+    #[tokio::test]
+    async fn writer_exits_when_both_lanes_close() {
+        let (client_transport, _server_transport) = handshake_pair();
+        let (write_half, _read_half) = tokio::io::duplex(64 * 1024);
+        let shutdown = CancellationToken::new();
+        let pacing_rate = Arc::new(AtomicU64::new(PACING_DEFAULT_RATE));
+        let paced = Arc::new(AtomicBool::new(false));
+        let (sink, handle) = spawn_frame_writer(
+            Arc::new(Mutex::new(client_transport)),
+            Box::new(write_half),
+            shutdown.clone(),
+            pacing_rate,
+            paced,
+        );
+
+        drop(sink); // closes both control_tx and data_tx
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("writer must exit promptly once both lanes close")
+            .expect("writer task must not panic");
+        assert!(
+            !shutdown.is_cancelled(),
+            "writer must exit on channel close, not by relying on shutdown"
         );
     }
 }
