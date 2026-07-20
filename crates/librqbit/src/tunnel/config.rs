@@ -28,15 +28,29 @@ pub(crate) const UDP_READ_BUF: usize = 64 * 1024;
 /// window × max streams per client).
 pub(crate) const DEFAULT_WINDOW: usize = 256 * 1024;
 
-/// Clamp bounds for the adaptive window (used by later B2 tasks).
+/// Clamp bounds for the adaptive window (kept for documentation of the window
+/// ceiling; `MAX_WINDOW == OPEN_WINDOW` so a per-stream window never exceeds the
+/// fixed open window).
 pub(crate) const MIN_WINDOW: usize = 64 * 1024;
-pub(crate) const MAX_WINDOW: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_WINDOW: usize = OPEN_WINDOW;
+
+/// Fixed, generous per-stream credit window used at EVERY stream open (both the
+/// client `open_tcp` and the server `OpenTcp` handler). This is a deliberate
+/// backstop that never binds in practice: aggregate per-carrier in-flight is
+/// bounded by the writer's *pacing* rate (`target / rtt`), not by this window,
+/// so a single long-lived stream still gets the full paced rate (throughput)
+/// while the pacing loop bounds latency. Because the receive queues are sized
+/// from this value (see `PER_STREAM_QUEUE` / `PER_CONN_QUEUE`), the invariant
+/// "queue capacity ≥ window" always holds — a stalled destination can never
+/// fill an undersized queue and head-of-line-block the shared reader.
+pub(crate) const OPEN_WINDOW: usize = 4 * 1024 * 1024;
 
 /// Clamp bounds for the per-carrier in-flight target driven by
 /// `flow::WindowController` (delay-adaptive AIMD over `RttEstimator`'s
-/// `queuing_delay`).
+/// `queuing_delay`). `MAX_TARGET` is aligned with `OPEN_WINDOW` so pacing at
+/// `target / rtt` is always the binding in-flight constraint, never the window.
 pub(crate) const MIN_TARGET: usize = 256 * 1024;
-pub(crate) const MAX_TARGET: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_TARGET: usize = 4 * 1024 * 1024;
 
 /// Below this queuing delay (and while the carrier is actually utilized), the
 /// link isn't self-inflicting bufferbloat, so `WindowController` grows the
@@ -61,16 +75,33 @@ pub(crate) const TARGET_BACKOFF_DEN: usize = 100;
 /// Bound on the outbound frame queue feeding a connection's single writer task.
 pub(crate) const OUTBOUND_QUEUE: usize = 256;
 
-/// Per-stream queue depth (in `READ_CHUNK`-sized frames). Derived from the flow
-/// window so it can hold a full window's worth of in-flight data: a
-/// credit-limited sender can then never fill the queue, so the shared frame
-/// reader never blocks on a single stream (no head-of-line blocking). The `+8`
-/// is slack for control frames.
-pub(crate) const PER_STREAM_QUEUE: usize = DEFAULT_WINDOW / READ_CHUNK + 8;
+/// Per-stream queue depth (in `READ_CHUNK`-sized frames). Derived from the
+/// LARGEST window a stream can ever be opened with (`OPEN_WINDOW`) — NOT the
+/// smaller `DEFAULT_WINDOW` — so it can always hold a full window's worth of
+/// in-flight data. This is the CRITICAL "queue capacity ≥ window" invariant: a
+/// credit-limited sender can then never fill the queue, so a stalled
+/// destination can't block the shared frame reader and head-of-line-block every
+/// other stream on the carrier. The `+8` is slack for control frames. The
+/// compile-time assertions below make the invariant un-rottable.
+pub(crate) const PER_STREAM_QUEUE: usize = OPEN_WINDOW / READ_CHUNK + 8;
 
 /// Bound on the client mux's per-connection inbound queue (TCP events / UDP
-/// datagrams routed to a single SOCKS handler). Same window-derived sizing.
-pub(crate) const PER_CONN_QUEUE: usize = DEFAULT_WINDOW / READ_CHUNK + 8;
+/// datagrams routed to a single SOCKS handler). Same `OPEN_WINDOW`-derived
+/// sizing, for the same head-of-line-blocking-avoidance reason.
+pub(crate) const PER_CONN_QUEUE: usize = OPEN_WINDOW / READ_CHUNK + 8;
+
+// The receive queues MUST be able to hold a full open-window of in-flight data,
+// or a stalled stream fills its queue and blocks the shared reader (carrier-wide
+// head-of-line blocking). These compile-time checks make that invariant
+// impossible to violate silently by retuning a constant.
+const _: () = assert!(
+    PER_STREAM_QUEUE * READ_CHUNK >= OPEN_WINDOW,
+    "PER_STREAM_QUEUE must hold a full OPEN_WINDOW of in-flight data"
+);
+const _: () = assert!(
+    PER_CONN_QUEUE * READ_CHUNK >= OPEN_WINDOW,
+    "PER_CONN_QUEUE must hold a full OPEN_WINDOW of in-flight data"
+);
 
 // ── Timeouts ────────────────────────────────────────────────────────────────
 
@@ -102,9 +133,11 @@ pub(crate) const DHT_PEER_CACHE: usize = 32;
 // ── Ping / RTT measurement ──────────────────────────────────────────────────
 
 /// How often each side sends a `Ping` on every carrier connection. Feeds the
-/// per-carrier `RttEstimator` (running-min + EWMA-smoothed RTT) — the
-/// observability foundation for the later adaptive-window controller.
-pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(1);
+/// per-carrier `RttEstimator` (running-min + EWMA-smoothed RTT) and drives one
+/// step of the adaptive-window control loop, so a faster interval means a
+/// faster ramp / quicker reaction to congestion. 250 ms is a balance between
+/// responsiveness and per-carrier ping overhead.
+pub(crate) const PING_INTERVAL: Duration = Duration::from_millis(250);
 
 /// EWMA smoothing factor for `RttEstimator::record`: alpha = NUM/DEN = 1/8,
 /// the standard TCP RTO smoothing factor (RFC 6298). Kept as an integer

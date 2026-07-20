@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::type_aliases::BoxAsyncWrite;
 
 use super::config::{
-    CONNECT_TIMEOUT, OUTBOUND_QUEUE, PACING_BURST, PER_STREAM_QUEUE, PING_INTERVAL,
+    CONNECT_TIMEOUT, OPEN_WINDOW, OUTBOUND_QUEUE, PACING_BURST, PER_STREAM_QUEUE, PING_INTERVAL,
     PING_NONCE_MAP_CAP, READ_CHUNK, UDP_READ_BUF,
 };
 use super::crypto::{NoiseTransport, TunnelCryptoError};
@@ -106,11 +106,19 @@ impl FrameSink {
 /// re-reads it on every frame, so a later controller task can drive it down
 /// from congestion signals while this task's callers just seed it at
 /// `config::PACING_DEFAULT_RATE` (effectively unlimited).
+///
+/// `paced` is the shared "the writer actually pace-throttled since the last
+/// control tick" flag: the writer sets it `true` whenever a pacing sleep really
+/// occurs (delay > 0). The control loop (`drive_flow_control`) reads-and-resets
+/// it as its `utilized` signal, so the controller only grows the target when
+/// pacing at `target / rtt` was genuinely the bottleneck — not on any trickle
+/// of traffic. It MUST be the SAME `Arc` handed to the control task.
 pub(crate) fn spawn_frame_writer(
     transport: Arc<Mutex<NoiseTransport>>,
     mut writer: BoxAsyncWrite,
     shutdown: CancellationToken,
     pacing_rate: Arc<AtomicU64>,
+    paced: Arc<AtomicBool>,
 ) -> (FrameSink, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<TunnelFrame>(OUTBOUND_QUEUE);
     let handle = tokio::spawn(async move {
@@ -138,26 +146,27 @@ pub(crate) fn spawn_frame_writer(
                 }
             };
 
-            // Pace DATA frames only. Now that the rate is real (the controller
-            // drives it to `target / rtt`), pacing control frames would break
-            // the very mechanisms pacing depends on: delaying a `Credit` stalls
-            // flow control, and delaying a `Ping`/`Pong` corrupts the RTT
-            // measurement that feeds the controller (a feedback loop). All
-            // control frames pass through with zero pacing delay; only the
-            // bulk-carrying `TcpData` / `UdpDatagram` frames are metered.
+            // Pace bulk `TcpData` frames ONLY. UDP is deliberately excluded:
+            // it's already best-effort/lossy (`try_send_lossy`), pacing it adds
+            // latency to real-time datagrams for no throughput benefit, and it
+            // stays out of the growth signal entirely. Pacing control frames
+            // would also break the very mechanisms pacing depends on: delaying a
+            // `Credit` stalls flow control, and delaying a `Ping`/`Pong`
+            // corrupts the RTT measurement that feeds the controller. So all
+            // control + UDP frames pass through with zero pacing delay.
             //
             // Pace on the encrypted blob's length (the wire-relevant size: the
             // ciphertext actually written, excluding only the 2-byte length
             // prefix). Re-read the rate each iteration so a live controller
-            // update takes effect on the very next frame.
-            if matches!(
-                frame,
-                TunnelFrame::TcpData { .. } | TunnelFrame::UdpDatagram { .. }
-            ) {
+            // update takes effect on the very next frame. When a real pacing
+            // sleep occurs, raise the shared `paced` flag — this is the control
+            // loop's `utilized` signal ("pacing was the bottleneck").
+            if matches!(frame, TunnelFrame::TcpData { .. }) {
                 bucket.set_rate(pacing_rate.load(Ordering::Relaxed));
                 let now_nanos = base.elapsed().as_nanos() as u64;
                 let delay_nanos = bucket.take(now_nanos, blob.len() as u64);
                 if delay_nanos > 0 {
+                    paced.store(true, Ordering::Relaxed);
                     tokio::time::sleep(Duration::from_nanos(delay_nanos)).await;
                 }
             }
@@ -232,11 +241,16 @@ pub(crate) async fn run_server_relay(
     // and the control task below (which drives it to `target / rtt`). Seeded at
     // the effectively-unlimited default until the first RTT sample lands.
     let pacing_rate = Arc::new(AtomicU64::new(super::config::PACING_DEFAULT_RATE));
+    // ONE "the writer pace-throttled since the last tick" flag, shared by the
+    // writer (which sets it) and the control task (which reads-and-resets it as
+    // its `utilized` signal). Same-Arc sharing is what makes the signal live.
+    let paced = Arc::new(AtomicBool::new(false));
     let (sink, writer_handle) = spawn_frame_writer(
         transport.clone(),
         writer,
         shutdown.clone(),
         pacing_rate.clone(),
+        paced.clone(),
     );
 
     let tcp: TcpMap = Arc::new(Mutex::new(HashMap::new()));
@@ -246,19 +260,19 @@ pub(crate) async fn run_server_relay(
     // probes the download direction; the `Ping` arm below answers the
     // client's pings so it can measure the upload direction.
     let rtt = Arc::new(StdMutex::new(RttEstimator::new()));
-    // Delay-adaptive in-flight controller + a "bytes sent since last tick"
-    // counter (incremented on every dest→peer `TcpData` in `open_and_pump`).
-    // The control task steps the controller from queuing delay + utilization
-    // and drives `pacing_rate`; new streams seed their send window from it.
+    // Delay-adaptive in-flight controller. The control task steps it from
+    // queuing delay + the writer's `paced` flag and drives `pacing_rate`
+    // (target / rtt), which bounds aggregate dest→peer in-flight data. New
+    // streams open with a fixed generous `OPEN_WINDOW` — pacing, not the
+    // window, is the in-flight control.
     let controller = Arc::new(StdMutex::new(WindowController::new()));
-    let bytes_sent = Arc::new(AtomicU64::new(0));
     let ping_inflight: PingInflight = Arc::new(StdMutex::new(HashMap::new()));
     tokio::spawn(server_control_task(
         sink.clone(),
         ping_inflight.clone(),
         rtt.clone(),
         controller.clone(),
-        bytes_sent.clone(),
+        paced.clone(),
         pacing_rate.clone(),
         shutdown.clone(),
     ));
@@ -298,11 +312,13 @@ pub(crate) async fn run_server_relay(
                 }
                 let (to_dest_tx, to_dest_rx) = mpsc::channel::<PeerToDest>(PER_STREAM_QUEUE);
                 let stream_token = shutdown.child_token();
-                // Seed the dest→peer send window from the carrier's controller,
-                // split across the streams already open (this one not yet
-                // inserted, so `map.len()` is the pre-existing count).
-                let window = controller.lock().unwrap().per_stream_window(map.len());
-                let send_credit = SendCredit::with_window(window);
+                // Open the dest→peer send window at the fixed generous
+                // `OPEN_WINDOW`: a backstop that never binds (aggregate in-flight
+                // is bounded by pacing at `target / rtt`, not this window), while
+                // the receive queue (`PER_STREAM_QUEUE`, sized from OPEN_WINDOW)
+                // is guaranteed to hold a full window — so a stalled destination
+                // can never head-of-line-block the shared reader.
+                let send_credit = SendCredit::with_window(OPEN_WINDOW);
                 let idle = IdleGuard::spawn(egress.idle_timeout, stream_token.clone());
                 map.insert(
                     stream_id,
@@ -325,7 +341,6 @@ pub(crate) async fn run_server_relay(
                     to_dest_rx,
                     send_credit,
                     idle,
-                    bytes_sent.clone(),
                     stream_token,
                 ));
             }
@@ -470,7 +485,7 @@ async fn server_control_task(
     inflight: PingInflight,
     rtt: Arc<StdMutex<RttEstimator>>,
     controller: Arc<StdMutex<WindowController>>,
-    bytes_sent: Arc<AtomicU64>,
+    paced: Arc<AtomicBool>,
     pacing_rate: Arc<AtomicU64>,
     shutdown: CancellationToken,
 ) {
@@ -491,9 +506,10 @@ async fn server_control_task(
             break;
         }
         // Step the controller from the freshest RTT estimate (fed by prior
-        // probes' `Pong`s) and update the writer's pacing rate — the same
-        // shared `pacing_rate` cell the writer re-reads per frame.
-        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
+        // probes' `Pong`s) and the writer's `paced` flag, and update the
+        // writer's pacing rate — the same shared `pacing_rate` cell the writer
+        // re-reads per frame.
+        drive_flow_control(&rtt, &controller, &paced, &pacing_rate);
     }
 }
 
@@ -510,7 +526,6 @@ async fn handle_tcp_stream(
     to_dest_rx: mpsc::Receiver<PeerToDest>,
     send_credit: SendCredit,
     idle: IdleGuard,
-    bytes_sent: Arc<AtomicU64>,
     token: CancellationToken,
 ) {
     let result = open_and_pump(
@@ -522,7 +537,6 @@ async fn handle_tcp_stream(
         to_dest_rx,
         &send_credit,
         &idle,
-        &bytes_sent,
         &token,
     )
     .await;
@@ -551,7 +565,6 @@ async fn open_and_pump(
     mut to_dest_rx: mpsc::Receiver<PeerToDest>,
     send_credit: &SendCredit,
     idle: &IdleGuard,
-    bytes_sent: &AtomicU64,
     token: &CancellationToken,
 ) -> Result<(), TunnelErrorCode> {
     let destination = parse_destination(&host, port);
@@ -650,9 +663,6 @@ async fn open_and_pump(
                     break;
                 }
                 idle.poke();
-                // Count dest→peer payload for the control task's utilization
-                // signal (drives the carrier's `WindowController`).
-                bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                 if !sink
                     .send(TunnelFrame::TcpData {
                         stream_id,
@@ -751,13 +761,15 @@ mod tests {
 
     /// Run the real writer task over a real Noise transport, send `n` frames
     /// each carrying `payload_len` bytes, and return (wall-clock elapsed,
-    /// total on-wire bytes written) by draining the raw length-prefixed
-    /// frames on the other end of an in-memory duplex pipe.
+    /// total on-wire bytes written, the shared `paced` flag) by draining the
+    /// raw length-prefixed frames on the other end of an in-memory duplex pipe.
+    /// The returned `paced` Arc is the EXACT one handed to the writer, so a test
+    /// can prove the writer sets it when (and only when) it actually throttles.
     async fn run_writer_and_measure(
         rate_bytes_per_s: u64,
         n_frames: usize,
         payload_len: usize,
-    ) -> (Duration, u64) {
+    ) -> (Duration, u64, Arc<AtomicBool>) {
         let (client_transport, _server_transport) = handshake_pair();
         // Sized generously so `write_all` never blocks on the reader side —
         // this test only cares about the writer's own internal pacing delay,
@@ -766,11 +778,13 @@ mod tests {
 
         let shutdown = CancellationToken::new();
         let pacing_rate = Arc::new(AtomicU64::new(rate_bytes_per_s));
+        let paced = Arc::new(AtomicBool::new(false));
         let (sink, _handle) = spawn_frame_writer(
             Arc::new(Mutex::new(client_transport)),
             Box::new(write_half),
             shutdown.clone(),
             pacing_rate,
+            paced.clone(),
         );
 
         let start = Instant::now();
@@ -800,7 +814,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         shutdown.cancel();
-        (elapsed, total_bytes)
+        (elapsed, total_bytes, paced)
     }
 
     /// The whole point of Task C: prove the writer's `tokio::time::sleep` is
@@ -816,7 +830,16 @@ mod tests {
         const N_FRAMES: usize = 18; // comfortably exceeds PACING_BURST (256 KiB)
         const LOW_RATE: u64 = 64 * 1024; // 64 KiB/s
 
-        let (elapsed, total_bytes) = run_writer_and_measure(LOW_RATE, N_FRAMES, PAYLOAD).await;
+        let (elapsed, total_bytes, paced) =
+            run_writer_and_measure(LOW_RATE, N_FRAMES, PAYLOAD).await;
+
+        // The writer must have raised the SHARED `paced` flag: this is the exact
+        // `Arc` the control loop reads as its `utilized` signal, so this proves
+        // the writer→control-loop half of the pacing-bound utilization wiring.
+        assert!(
+            paced.load(Ordering::Relaxed),
+            "writer must set the shared `paced` flag when it throttles for pacing"
+        );
 
         let deficit = total_bytes.saturating_sub(PACING_BURST);
         assert!(
@@ -848,12 +871,19 @@ mod tests {
         const PAYLOAD: usize = 16 * 1024;
         const N_FRAMES: usize = 18;
 
-        let (elapsed, _total_bytes) =
+        let (elapsed, _total_bytes, paced) =
             run_writer_and_measure(PACING_DEFAULT_RATE, N_FRAMES, PAYLOAD).await;
 
         assert!(
             elapsed < Duration::from_millis(500),
             "default pacing rate should not meaningfully delay throughput, took {elapsed:?}"
+        );
+        // At the effectively-unlimited default rate the writer never sleeps for
+        // pacing, so the shared `paced` flag must stay false — the control loop
+        // must NOT see a spurious "utilized" signal when pacing didn't bind.
+        assert!(
+            !paced.load(Ordering::Relaxed),
+            "writer must NOT set `paced` when the default rate never throttles"
         );
     }
 }

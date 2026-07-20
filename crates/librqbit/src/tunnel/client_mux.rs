@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
@@ -25,7 +25,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::client::TunnelClient;
-use super::config::{PACING_DEFAULT_RATE, PER_CONN_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP};
+use super::config::{
+    OPEN_WINDOW, PACING_DEFAULT_RATE, PER_CONN_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP,
+};
 use super::crypto::NoiseTransport;
 use super::flow::{
     RttEstimator, SendCredit, WindowController, drive_flow_control, record_ping_sent,
@@ -76,18 +78,23 @@ pub(crate) struct ClientMux {
     /// task sends probes, `reader_loop`'s `Pong` arm records the samples.
     rtt: Arc<StdMutex<RttEstimator>>,
     /// Delay-adaptive in-flight controller. The control task steps it from the
-    /// carrier's queuing delay; `open_tcp` seeds each new stream's send window
-    /// from `per_stream_window(load)`.
+    /// carrier's queuing delay + the writer's `paced` flag, and drives
+    /// `pacing_rate` (target / rtt) — which bounds aggregate local→tunnel
+    /// in-flight. `open_tcp` opens every stream with a fixed generous
+    /// `OPEN_WINDOW`; pacing, not the window, is the in-flight control.
     controller: Arc<StdMutex<WindowController>>,
-    /// Local→tunnel bytes sent since the control task last read it (utilization
-    /// signal, read-and-reset each tick). Incremented in `send_tcp_data`.
-    bytes_sent: Arc<AtomicU64>,
+    /// The writer's "pace-throttled since the last tick" flag. The SAME `Arc` is
+    /// handed to `spawn_frame_writer` (which sets it when a pacing sleep occurs)
+    /// and the control task (which reads-and-resets it as its `utilized`
+    /// signal), so growth only fires when pacing was genuinely the bottleneck.
+    paced: Arc<AtomicBool>,
     /// The writer's pacing-rate cell (bytes/s). The SAME `Arc` is handed to
     /// `spawn_frame_writer` (which re-reads it per frame) and the control task
     /// (which drives it to `target / rtt`); kept here for the test accessor.
     pacing_rate: Arc<AtomicU64>,
     /// Test-only: the window (bytes) the most recent `open_tcp` seeded its
-    /// `SendCredit` with, so a test can prove the seed is controller-derived.
+    /// `SendCredit` with, so a test can prove the generous fixed `OPEN_WINDOW`
+    /// actually reaches `SendCredit::with_window`.
     #[cfg(test)]
     last_open_window: Arc<AtomicUsize>,
 }
@@ -102,11 +109,17 @@ impl ClientMux {
         // Seeded at the effectively-unlimited default until the first RTT
         // sample lands.
         let pacing_rate = Arc::new(AtomicU64::new(PACING_DEFAULT_RATE));
+        // ONE "the writer pace-throttled since the last tick" flag, shared by
+        // the writer (which sets it) and the control task (which reads-and-
+        // resets it as its `utilized` signal). Same-Arc sharing is what makes
+        // the signal live.
+        let paced = Arc::new(AtomicBool::new(false));
         let (sink, _writer_handle) = spawn_frame_writer(
             transport.clone(),
             writer,
             shutdown.clone(),
             pacing_rate.clone(),
+            paced.clone(),
         );
 
         let tcp: TcpRoutes = Arc::new(Mutex::new(HashMap::new()));
@@ -114,7 +127,6 @@ impl ClientMux {
         let load = Arc::new(AtomicUsize::new(0));
         let rtt = Arc::new(StdMutex::new(RttEstimator::new()));
         let controller = Arc::new(StdMutex::new(WindowController::new()));
-        let bytes_sent = Arc::new(AtomicU64::new(0));
         let ping_inflight: PingInflight = Arc::new(StdMutex::new(HashMap::new()));
 
         let mux = Arc::new(Self {
@@ -128,7 +140,7 @@ impl ClientMux {
             load: load.clone(),
             rtt: rtt.clone(),
             controller: controller.clone(),
-            bytes_sent: bytes_sent.clone(),
+            paced: paced.clone(),
             pacing_rate: pacing_rate.clone(),
             #[cfg(test)]
             last_open_window: Arc::new(AtomicUsize::new(0)),
@@ -150,7 +162,7 @@ impl ClientMux {
             ping_inflight,
             rtt,
             controller,
-            bytes_sent,
+            paced,
             pacing_rate,
             shutdown,
         ));
@@ -171,10 +183,12 @@ impl ClientMux {
     ) -> Option<(u64, mpsc::Receiver<InboundTcp>, SendCredit)> {
         let stream_id = self.next_stream_id.fetch_add(2, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(PER_CONN_QUEUE);
-        // Seed the local→tunnel send window from the carrier's controller,
-        // split across the streams already open (this one isn't registered
-        // yet, so `load()` is the pre-existing count).
-        let window = self.controller.lock().unwrap().per_stream_window(self.load());
+        // Open the local→tunnel send window at the fixed generous `OPEN_WINDOW`:
+        // a backstop that never binds (aggregate in-flight is bounded by pacing
+        // at `target / rtt`, not this window), while the receive queue
+        // (`PER_CONN_QUEUE`, sized from OPEN_WINDOW) is guaranteed to hold a full
+        // window — so a stalled peer can never head-of-line-block the reader.
+        let window = OPEN_WINDOW;
         #[cfg(test)]
         self.last_open_window.store(window, Ordering::Relaxed);
         let send_credit = SendCredit::with_window(window);
@@ -208,10 +222,9 @@ impl ClientMux {
     }
 
     pub(crate) async fn send_tcp_data(&self, stream_id: u64, bytes: Bytes) -> bool {
-        // Count local→tunnel payload for the control task's utilization signal
-        // (drives the carrier's `WindowController`).
-        self.bytes_sent
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        // The control task's utilization signal is the writer's `paced` flag
+        // (set when pacing actually throttles a `TcpData` frame), so there's no
+        // per-send counter to maintain here.
         self.sink
             .send(TunnelFrame::TcpData { stream_id, bytes })
             .await
@@ -318,8 +331,8 @@ impl ClientMux {
     }
 
     /// The window (bytes) the most recent `open_tcp` seeded its `SendCredit`
-    /// with. Test-only accessor proving new streams open with a
-    /// controller-derived window (not the fixed default).
+    /// with. Test-only accessor proving the fixed generous `OPEN_WINDOW`
+    /// actually reaches `SendCredit::with_window` at the open site.
     #[cfg(test)]
     pub(crate) fn last_open_window_for_test(&self) -> usize {
         self.last_open_window.load(Ordering::Relaxed)
@@ -337,7 +350,7 @@ async fn ping_and_control_task(
     inflight: PingInflight,
     rtt: Arc<StdMutex<RttEstimator>>,
     controller: Arc<StdMutex<WindowController>>,
-    bytes_sent: Arc<AtomicU64>,
+    paced: Arc<AtomicBool>,
     pacing_rate: Arc<AtomicU64>,
     shutdown: CancellationToken,
 ) {
@@ -358,9 +371,10 @@ async fn ping_and_control_task(
             break;
         }
         // Step the controller from the freshest RTT estimate (fed by prior
-        // probes' `Pong`s) and update the writer's pacing rate — the same
-        // shared `pacing_rate` cell the writer re-reads per frame.
-        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
+        // probes' `Pong`s) and the writer's `paced` flag, and update the
+        // writer's pacing rate — the same shared `pacing_rate` cell the writer
+        // re-reads per frame.
+        drive_flow_control(&rtt, &controller, &paced, &pacing_rate);
     }
 }
 

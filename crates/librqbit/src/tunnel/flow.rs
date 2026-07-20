@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, Semaphore};
@@ -220,40 +220,63 @@ fn ewma_step(smooth: Duration, sample: Duration) -> Duration {
 // interactive tunnel that would rather cap latency than max out throughput.
 
 /// Per-carrier controller over an in-flight target (bytes), driven by
-/// self-inflicted queuing delay. Additive-increase while the link is
-/// utilized and queuing delay stays low; multiplicative-decrease as soon as
-/// queuing delay rises, before a real loss-based signal would ever fire.
+/// self-inflicted queuing delay. Slow-start (multiplicative ×2 growth) while
+/// the link is utilized and queuing delay stays low and no congestion has been
+/// seen yet; additive-increase after the first congestion event; and
+/// multiplicative-decrease as soon as queuing delay rises, before a real
+/// loss-based signal would ever fire.
+///
+/// The `target` bounds *aggregate* per-carrier in-flight data via the writer's
+/// pacing rate (`target / rtt`); it is NOT a per-stream window (streams open
+/// with a fixed generous `config::OPEN_WINDOW` so pacing, not the window, is the
+/// sole in-flight control).
 pub(crate) struct WindowController {
     target: usize,
+    /// True until the first congestion event (queuing delay above
+    /// `QUEUING_DELAY_HIGH`). While set, low-delay utilized growth is
+    /// multiplicative (×2, TCP slow-start) so the target ramps to the path's
+    /// capacity in a few RTTs instead of crawling up additively.
+    in_slow_start: bool,
 }
 
 impl WindowController {
     /// A fresh controller, starting at the conservative floor
-    /// (`config::MIN_TARGET`) rather than assuming the link can already take
-    /// the max.
+    /// (`config::MIN_TARGET`) in slow-start rather than assuming the link can
+    /// already take the max.
     pub(crate) fn new() -> Self {
         Self {
             target: config::MIN_TARGET,
+            in_slow_start: true,
         }
     }
 
     /// One control step, called once per RTT sample.
     ///
     /// `queuing_delay` is `rtt_smooth - rtt_min` from the carrier's
-    /// `RttEstimator`. `utilized` is whether the carrier actually hit send
-    /// backpressure (credit exhausted on some stream) since the last step —
-    /// growth is gated on this so an idle low-delay link doesn't get its
-    /// target inflated for no reason (there's no evidence yet that a bigger
-    /// window would even be used, let alone that the link can sustain it).
+    /// `RttEstimator`. `utilized` is whether the writer actually had to
+    /// pace-throttle (sleep for pacing) since the last step — i.e. pacing at
+    /// `target / rtt` was the real bottleneck. Growth is gated on this so an
+    /// idle or under-driven low-delay link doesn't get its target inflated for
+    /// no reason (there's no evidence the link can sustain more until pacing is
+    /// actually the constraint).
     ///
     /// Backoff, by contrast, isn't gated on utilization: a high queuing delay
     /// means something (even a long-past burst) is still draining through a
-    /// buffer, so it always takes precedence over growth/hold.
+    /// buffer, so it always takes precedence over growth/hold — and it also
+    /// exits slow-start, so subsequent growth is cautious (additive) rather
+    /// than doubling straight back into congestion.
     pub(crate) fn step(&mut self, queuing_delay: Duration, utilized: bool) {
         if queuing_delay > config::QUEUING_DELAY_HIGH {
             self.target = self.target * config::TARGET_BACKOFF_NUM / config::TARGET_BACKOFF_DEN;
+            self.in_slow_start = false;
         } else if utilized && queuing_delay < config::QUEUING_DELAY_LOW {
-            self.target = self.target.saturating_add(config::TARGET_GROW_STEP);
+            self.target = if self.in_slow_start {
+                // Slow-start: double toward capacity. A ×2 that would overshoot
+                // MAX_TARGET just clamps below.
+                self.target.saturating_mul(2)
+            } else {
+                self.target.saturating_add(config::TARGET_GROW_STEP)
+            };
         }
         // else: delay is in [LOW, HIGH], or low-but-idle — hold.
 
@@ -263,16 +286,6 @@ impl WindowController {
     /// The current per-carrier in-flight target (bytes).
     pub(crate) fn target(&self) -> usize {
         self.target
-    }
-
-    /// Per-stream window = the carrier's target split evenly across
-    /// `active_streams`, clamped to `[MIN_WINDOW, MAX_WINDOW]`. Zero active
-    /// streams is treated as one (no divide-by-zero, and a carrier with no
-    /// streams yet should still hand out a sane starting window to the next
-    /// one that opens).
-    pub(crate) fn per_stream_window(&self, active_streams: usize) -> usize {
-        let divisor = active_streams.max(1);
-        (self.target / divisor).clamp(config::MIN_WINDOW, config::MAX_WINDOW)
     }
 }
 
@@ -293,10 +306,16 @@ impl Default for WindowController {
 // self-inflicted queuing delay low while letting throughput rise as the
 // controller grows `target` on a clear path.
 
-/// Step `controller` from the carrier's freshest queuing delay and whether it
-/// moved any data since the last tick (`bytes_sent` delta > 0 — read-and-reset
-/// here), then store `target / rtt_smooth` (bytes/s) into `pacing_rate` for the
-/// writer to pick up on its next frame.
+/// Step `controller` from the carrier's freshest queuing delay and whether the
+/// writer actually had to pace-throttle since the last tick (`paced` flag —
+/// read-and-reset here), then store `target / rtt_smooth` (bytes/s) into
+/// `pacing_rate` for the writer to pick up on its next frame.
+///
+/// `utilized` means "pacing at `target / rtt` was the real bottleneck" (the
+/// writer slept for pacing), NOT merely "some bytes moved". Gating growth on
+/// this means the target only ramps up when there's genuine evidence the link
+/// could carry more than the current pace allows — a trickle of traffic that
+/// never hits the pacing limit no longer ratchets the target to the max.
 ///
 /// Guards `rtt_smooth == 0` (no sample yet — leaves `pacing_rate` at its
 /// effectively-unlimited default so the writer never throttles before it can
@@ -304,16 +323,17 @@ impl Default for WindowController {
 pub(crate) fn drive_flow_control(
     rtt: &StdMutex<RttEstimator>,
     controller: &StdMutex<WindowController>,
-    bytes_sent: &AtomicU64,
+    paced: &AtomicBool,
     pacing_rate: &AtomicU64,
 ) {
     let (queuing_delay, rtt_smooth) = {
         let est = rtt.lock().unwrap();
         (est.queuing_delay(), est.rtt_smooth())
     };
-    // Utilized = the carrier actually pushed data since the last tick. Gating
-    // growth on this stops an idle low-delay link from inflating `target`.
-    let utilized = bytes_sent.swap(0, Ordering::Relaxed) > 0;
+    // Utilized = the writer actually throttled on the pacing rate since the last
+    // tick (pacing was the bottleneck). Gating growth on this stops a low-rate
+    // trickle — or an idle low-delay link — from inflating `target`.
+    let utilized = paced.swap(false, Ordering::Relaxed);
 
     let target = {
         let mut ctl = controller.lock().unwrap();
@@ -326,9 +346,7 @@ pub(crate) fn drive_flow_control(
     // the "no RTT sample yet" guard: rtt_nanos == 0 yields `None`, so we leave
     // `pacing_rate` at its effectively-unlimited default until the path is
     // measured (the writer must not throttle before it can measure).
-    if let Some(rate) =
-        (target as u128 * 1_000_000_000u128).checked_div(rtt_smooth.as_nanos())
-    {
+    if let Some(rate) = (target as u128 * 1_000_000_000u128).checked_div(rtt_smooth.as_nanos()) {
         let rate = rate.clamp(config::MIN_PACING_RATE as u128, u64::MAX as u128) as u64;
         pacing_rate.store(rate, Ordering::Relaxed);
     }
@@ -537,22 +555,57 @@ mod tests {
     }
 
     #[test]
-    fn window_controller_grows_additively_while_low_delay_and_utilized() {
+    fn window_controller_slow_start_doubles_while_low_delay_and_utilized() {
         let mut ctl = WindowController::new();
         let low_delay = Duration::from_millis(1);
 
+        // A fresh controller is in slow-start: each utilized low-delay step
+        // DOUBLES the target (256K → 512K → 1M → 2M → 4M) until it clamps at
+        // MAX_TARGET (== 4 MiB).
+        let mut expected = config::MIN_TARGET;
+        while expected < config::MAX_TARGET {
+            ctl.step(low_delay, true);
+            expected = (expected * 2).min(config::MAX_TARGET);
+            assert_eq!(
+                ctl.target(),
+                expected,
+                "slow-start should double the target each utilized low-delay step"
+            );
+        }
+        // Once at MAX_TARGET a further ×2 just clamps back to MAX_TARGET.
         ctl.step(low_delay, true);
         assert_eq!(
             ctl.target(),
-            config::MIN_TARGET + config::TARGET_GROW_STEP,
-            "one utilized low-delay step should grow by exactly one grow-step"
+            config::MAX_TARGET,
+            "a ×2 that would exceed MAX_TARGET must clamp, not overshoot"
+        );
+    }
+
+    #[test]
+    fn window_controller_post_congestion_growth_is_additive() {
+        let mut ctl = WindowController::new();
+        let low_delay = Duration::from_millis(1);
+        let high_delay = Duration::from_millis(50);
+
+        // Grow in slow-start, then a congestion event backs off AND exits
+        // slow-start.
+        ctl.step(low_delay, true); // 256K → 512K (slow-start double)
+        assert_eq!(ctl.target(), 2 * config::MIN_TARGET);
+        ctl.step(high_delay, true); // back off ×0.85, in_slow_start = false
+        let after_backoff = ctl.target();
+        assert_eq!(
+            after_backoff,
+            (2 * config::MIN_TARGET * config::TARGET_BACKOFF_NUM / config::TARGET_BACKOFF_DEN)
+                .clamp(config::MIN_TARGET, config::MAX_TARGET)
         );
 
+        // Now that slow-start is over, low-delay utilized growth is ADDITIVE
+        // (+TARGET_GROW_STEP), not another double.
         ctl.step(low_delay, true);
         assert_eq!(
             ctl.target(),
-            config::MIN_TARGET + 2 * config::TARGET_GROW_STEP,
-            "growth should accumulate additively across steps"
+            (after_backoff + config::TARGET_GROW_STEP).min(config::MAX_TARGET),
+            "after a congestion event, growth must be additive (+grow-step), not ×2"
         );
     }
 
@@ -670,94 +723,76 @@ mod tests {
     }
 
     #[test]
-    fn per_stream_window_splits_target_across_active_streams() {
-        let mut ctl = WindowController::new();
-        let low_delay = Duration::from_millis(1);
-
-        // Grow target to exactly 1 MiB.
-        while ctl.target() < 1024 * 1024 {
-            ctl.step(low_delay, true);
-        }
-        assert_eq!(ctl.target(), 1024 * 1024);
-
-        assert_eq!(
-            ctl.per_stream_window(4),
-            256 * 1024,
-            "1 MiB target split across 4 active streams should be 256 KiB"
-        );
-    }
-
-    #[test]
-    fn per_stream_window_clamps_to_min_and_max() {
-        let mut ctl = WindowController::new();
-
-        // At MIN_TARGET, splitting across many streams must clamp up to
-        // MIN_WINDOW rather than returning something tiny.
-        assert_eq!(ctl.per_stream_window(1000), config::MIN_WINDOW);
-
-        // Growing to MAX_TARGET with a single active stream must clamp down
-        // to MAX_WINDOW rather than handing one stream the whole target.
-        let low_delay = Duration::from_millis(1);
-        let steps = (config::MAX_TARGET / config::TARGET_GROW_STEP) + 10;
-        for _ in 0..steps {
-            ctl.step(low_delay, true);
-        }
-        assert_eq!(ctl.target(), config::MAX_TARGET);
-        assert_eq!(ctl.per_stream_window(1), config::MAX_WINDOW);
-    }
-
-    #[test]
-    fn per_stream_window_treats_zero_active_streams_as_one() {
-        let ctl = WindowController::new();
-        assert_eq!(
-            ctl.per_stream_window(0),
-            ctl.per_stream_window(1),
-            "0 active streams must not divide-by-zero and should behave like 1"
-        );
-    }
-
-    #[test]
     fn drive_flow_control_grows_target_and_sets_pacing_from_target_over_rtt() {
-        use super::super::config::{MIN_TARGET, PACING_DEFAULT_RATE, TARGET_GROW_STEP};
+        use super::super::config::{MIN_TARGET, PACING_DEFAULT_RATE};
 
         let rtt = StdMutex::new(RttEstimator::new());
         let controller = StdMutex::new(WindowController::new());
-        let bytes_sent = AtomicU64::new(0);
+        let paced = AtomicBool::new(false);
         let pacing_rate = AtomicU64::new(PACING_DEFAULT_RATE);
 
         // No RTT sample yet: pacing stays at the untouched default (the writer
-        // must not throttle before it can measure the path), and with no bytes
-        // moved the target holds at MIN_TARGET.
-        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
+        // must not throttle before it can measure the path), and with the writer
+        // never having paced (`paced == false`) the target holds at MIN_TARGET.
+        drive_flow_control(&rtt, &controller, &paced, &pacing_rate);
         assert_eq!(pacing_rate.load(Ordering::Relaxed), PACING_DEFAULT_RATE);
         assert_eq!(controller.lock().unwrap().target(), MIN_TARGET);
 
-        // Feed a low-delay 10ms RTT sample and register data moved since the
-        // last tick: the controller must grow one step and pacing must drop to
-        // the finite `target / rtt` value (well under the default cap).
+        // Feed a low-delay 10ms RTT sample and signal the writer pace-throttled
+        // since the last tick (`paced == true`): a fresh controller is in
+        // slow-start, so the target DOUBLES, and pacing must drop to the finite
+        // `target / rtt` value (well under the default cap).
         rtt.lock().unwrap().record(Duration::from_millis(10));
-        bytes_sent.store(64 * 1024, Ordering::Relaxed);
-        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
+        paced.store(true, Ordering::Relaxed);
+        drive_flow_control(&rtt, &controller, &paced, &pacing_rate);
 
         assert_eq!(
             controller.lock().unwrap().target(),
-            MIN_TARGET + TARGET_GROW_STEP,
-            "one utilized low-delay tick should grow the target by one step"
+            2 * MIN_TARGET,
+            "one utilized low-delay tick in slow-start should double the target"
         );
-        // bytes_sent must have been read-and-reset.
-        assert_eq!(bytes_sent.load(Ordering::Relaxed), 0);
+        // The paced flag must have been read-and-reset.
+        assert!(!paced.load(Ordering::Relaxed));
 
         let rate = pacing_rate.load(Ordering::Relaxed);
         assert_ne!(
             rate, PACING_DEFAULT_RATE,
             "pacing rate must have been driven off the default cap"
         );
-        // target = MIN_TARGET + one step, rtt = 10ms → rate = target * 100.
-        let target = (MIN_TARGET + TARGET_GROW_STEP) as u64;
+        // target = 2 * MIN_TARGET, rtt = 10ms → rate = target * 100.
+        let target = (2 * MIN_TARGET) as u64;
         assert_eq!(
             rate,
             target * 100,
             "rate must equal target_bytes / rtt_seconds (10ms → ×100)"
+        );
+    }
+
+    #[test]
+    fn drive_flow_control_unpaced_tick_does_not_grow() {
+        use super::super::config::{MIN_TARGET, PACING_DEFAULT_RATE};
+
+        let rtt = StdMutex::new(RttEstimator::new());
+        let controller = StdMutex::new(WindowController::new());
+        let paced = AtomicBool::new(false);
+        let pacing_rate = AtomicU64::new(PACING_DEFAULT_RATE);
+
+        // A low-delay RTT sample but the writer never pace-throttled: even
+        // though pacing is now driven off the default, the target must HOLD —
+        // a trickle that never hits the pacing limit is not evidence the link
+        // can carry more.
+        rtt.lock().unwrap().record(Duration::from_millis(10));
+        drive_flow_control(&rtt, &controller, &paced, &pacing_rate);
+
+        assert_eq!(
+            controller.lock().unwrap().target(),
+            MIN_TARGET,
+            "an unpaced (non-utilized) low-delay tick must hold the target"
+        );
+        assert_ne!(
+            pacing_rate.load(Ordering::Relaxed),
+            PACING_DEFAULT_RATE,
+            "pacing rate is still driven from target/rtt once an RTT sample exists"
         );
     }
 
@@ -767,14 +802,14 @@ mod tests {
 
         let rtt = StdMutex::new(RttEstimator::new());
         let controller = StdMutex::new(WindowController::new());
-        let bytes_sent = AtomicU64::new(0);
+        let paced = AtomicBool::new(false);
         let pacing_rate = AtomicU64::new(0);
 
         // A huge RTT over the floor-level (MIN_TARGET) target would compute a
         // sub-floor rate; the clamp must hold it at MIN_PACING_RATE so the
         // writer never stalls to ~0.
         rtt.lock().unwrap().record(Duration::from_secs(100));
-        drive_flow_control(&rtt, &controller, &bytes_sent, &pacing_rate);
+        drive_flow_control(&rtt, &controller, &paced, &pacing_rate);
 
         assert_eq!(
             pacing_rate.load(Ordering::Relaxed),
