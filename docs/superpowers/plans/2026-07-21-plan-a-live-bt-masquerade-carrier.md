@@ -30,7 +30,7 @@ Created:
 Modified:
 - `carrier.rs` — deterministic corpus (seed the RNG).
 - `carrier_wire.rs` — split post-establish `CarrierWire` into `CarrierReadHalf` / `CarrierWriteHalf`; add chunked send + a cover channel.
-- `options.rs` — add `carrier_root` to `TunnelClientOptions`; add a `CarrierMode` flag.
+- `options.rs` — add `carrier_root` to `TunnelClientOptions`.
 - `config.rs` — carrier identity constants (piece length, corpus size band, distro name list).
 - `service.rs` — server announces on `handshake_info_hash`, builds the carrier store.
 - `client_pool.rs` / `client_supervisor.rs` — client builds the store, discovers via `handshake_info_hash`, threads the store into the mux.
@@ -498,20 +498,16 @@ git commit -m "feat(tunnel): rq_tunnel chunk/defrag layer for Noise blobs"
 
 ---
 
-## Task 4: Client `carrier_root` option + `CarrierMode` flag
+## Task 4: Client `carrier_root` option
 
-The client needs a place to persist its copy of the carrier torrent (to present the correct `info_hash` and serve piece cover). A `CarrierMode` flag lets tests keep the legacy raw-Noise path.
+The client needs a place to persist its copy of the carrier torrent (to present the correct `info_hash` and serve piece cover). The server already has `carrier_root`; add the mirror to the client. **Design revision (approved):** there is NO dual-mode flag — the masquerade carrier wholly replaces the raw-Noise path. Isolation is preserved by unit tests on the new modules (chunk/defrag/split), not by keeping a second relay path.
 
 **Files:**
-- Modify: `crates/librqbit/src/tunnel/options.rs` (client struct + defaults + a mode enum)
+- Modify: `crates/librqbit/src/tunnel/options.rs` (client struct + defaults)
 - Test: `options.rs` tests
 
 **Interfaces:**
-- Produces:
-  - `pub enum CarrierMode { RawNoise, BtMasquerade }` (default `BtMasquerade`)
-  - `TunnelClientOptions.carrier_root: PathBuf`
-  - `TunnelClientOptions.carrier_mode: CarrierMode`
-  - `TunnelServerOptions.carrier_mode: CarrierMode`
+- Produces: `TunnelClientOptions.carrier_root: PathBuf`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -519,57 +515,33 @@ Add to `options.rs` tests:
 
 ```rust
 #[test]
-fn client_defaults_to_bt_masquerade() {
+fn client_has_carrier_root_default() {
     let o = super::TunnelClientOptions::default();
-    assert!(matches!(o.carrier_mode, super::CarrierMode::BtMasquerade));
+    assert!(!o.carrier_root.as_os_str().is_empty());
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p librqbit tunnel::options 2>&1 | tail -20`
-Expected: FAIL to compile — `CarrierMode` / `carrier_mode` unknown.
+Expected: FAIL to compile — no field `carrier_root` on `TunnelClientOptions`.
 
-- [ ] **Step 3: Add the enum and fields**
+- [ ] **Step 3: Add the field**
 
-In `options.rs` add the enum near the top (after the error enum):
-
-```rust
-/// Selects how a carrier connection frames tunnel traffic on the wire.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CarrierMode {
-    /// Legacy: raw `[u16 len][ciphertext]` Noise frames. Test-only.
-    RawNoise,
-    /// Default: real BT handshake + BEP-10 + `rq_tunnel` piece-cover carrier.
-    #[default]
-    BtMasquerade,
-}
-```
-
-Add fields to `TunnelClientOptions` (struct at `options.rs:38`):
+Add to `TunnelClientOptions` (struct at `options.rs:38`):
 
 ```rust
     /// Root dir for this client's copy of the carrier torrent store.
     pub carrier_root: PathBuf,
-    /// Carrier framing mode.
-    pub carrier_mode: CarrierMode,
-```
-
-Add to `TunnelServerOptions` (struct at `options.rs:77`, after `carrier_root`):
-
-```rust
-    /// Carrier framing mode.
-    pub carrier_mode: CarrierMode,
 ```
 
 Update the `TunnelClientOptions` `Default` impl (around `options.rs:64-70`) to include:
 
 ```rust
             carrier_root: std::env::temp_dir().join("rqbit-tunnel-carrier-client"),
-            carrier_mode: CarrierMode::default(),
 ```
 
-Update the two server option literals in `options.rs` tests (`:233`, `:251`) and the `service.rs`/`options.rs` server test literal to add `carrier_mode: CarrierMode::default(),`. The compiler lists every missing-field site.
+Ensure `use std::path::PathBuf;` is present in `options.rs` (the server struct already uses `PathBuf`, so it is imported).
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -581,7 +553,7 @@ Expected: PASS.
 ```bash
 cargo fmt --all
 git add crates/librqbit/src/tunnel/options.rs
-git commit -m "feat(tunnel): client carrier_root + CarrierMode flag"
+git commit -m "feat(tunnel): client carrier_root option"
 ```
 
 ---
@@ -943,7 +915,7 @@ pub(crate) struct AdmittedPeer {
 
 - [ ] **Step 2: Rewrite `accept` to establish the carrier and do Noise over it**
 
-Replace `server.rs:85-138` (after acquiring `carrier_hash` param) with (BtMasquerade path; the RawNoise path stays for tests behind the mode check — keep the old body in an `if` branch):
+Replace `server.rs:85-138` (after acquiring `carrier_hash` param) wholesale — the raw-Noise body is removed entirely:
 
 ```rust
         // ── Step 1: MSE responder ───────────────────────────────────────────
@@ -1179,7 +1151,7 @@ and in the rq_tunnel arm push extras: `for blob in defrag.push(...) { pending.pu
 
 - [ ] **Step 5: Run the server-side E2E tests in masquerade mode**
 
-Ensure the test harness constructs server options with `carrier_mode: CarrierMode::BtMasquerade` and a `carrier_root` tempdir. Run the existing SOCKS-through-tunnel tests:
+Ensure the test harness constructs server options with a `carrier_root` tempdir. Run the existing SOCKS-through-tunnel tests:
 
 Run: `cargo test -p librqbit tunnel:: 2>&1 | tail -40`
 Expected: the existing E2E tests (`socks_connect_reaches_server_side_tcp_echo_only_through_tunnel`, `udp_associate_echoes_datagram_through_tunnel`, `real_relay_transfers_large_payload_with_flow_control`, …) PASS through the carrier once Task 8 lands the client. Until then, run only server-focused unit tests and `cargo check`.
@@ -1302,7 +1274,7 @@ In `reader_loop` (`client_mux.rs:383-474`): replace the signature's `reader`/add
 
 - [ ] **Step 5: Run the full tunnel E2E suite in masquerade mode**
 
-Update the test harness (`build_real_relay_pair`, `start_live_carrier_pool`, and any option builders in `tests/tunnel.rs`) to set `carrier_mode: BtMasquerade` + `carrier_root` tempdirs on BOTH client and server options.
+Update the test harness (`build_real_relay_pair`, `start_live_carrier_pool`, and any option builders in `tests/tunnel.rs`) to set `carrier_root` tempdirs on BOTH client and server options.
 
 Run: `cargo test -p librqbit tunnel 2>&1 | tail -60`
 Expected: ALL existing tunnel E2E tests PASS through the masquerade carrier — specifically:
@@ -1454,7 +1426,7 @@ git commit -m "docs(tunnel): record Plan A pcap milestone results"
 - info_hash unification (DHT ↔ handshake) → Tasks 5. ✓ (MSE key stays `carrier_hash`; DHT + handshake use `handshake_info_hash`.)
 - 64 KiB → 16 KiB chunking → Task 3, consumed in 7–8. ✓
 - Preserve flow control / pacing / control lane → Task 7 Step 3 (token bucket unchanged; control lane preserved; cover lane added below control, above data). ✓
-- Feature flag, no wire compatibility → Task 4 (`CarrierMode`, default `BtMasquerade`; `RawNoise` kept for tests). ✓
+- No wire compatibility (wholesale replacement, no dual mode — approved revision) → Tasks 4/7/8 replace the raw path outright; isolation preserved by unit tests on the new modules. ✓
 - Remove `#![allow(dead_code)]` for wired modules → Task 9 Step 4. ✓
 - E2E gate: capture harness sees Handshake/ExtendedHandshake/Bitfield/Piece/Request; existing integration tests pass; SOCKS TCP+UDP traverse; milestone pcap → Tasks 8 Step 5, 9, 10. ✓
 
