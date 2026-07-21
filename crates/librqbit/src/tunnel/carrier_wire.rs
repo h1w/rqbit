@@ -244,6 +244,77 @@ impl CarrierWire {
     }
 }
 
+/// Owns the carrier writer half. All outbound BT messages (tunnel chunks and
+/// piece cover) go through this single owner, preserving Noise sequence order.
+pub(crate) struct CarrierWriteHalf {
+    writer: BoxAsyncWrite,
+    peer_ids: PeerExtendedMessageIds,
+    scratch: Vec<u8>,
+}
+
+impl CarrierWriteHalf {
+    /// Write one already-chunked tunnel payload as an `rq_tunnel` message.
+    pub(crate) async fn send_tunnel(&mut self, payload: &[u8]) -> Result<(), CarrierWireError> {
+        let msg = Message::Extended(ExtendedMessage::RqTunnel(RqTunnelMessage::from_bytes(
+            payload,
+        )));
+        write_message(&mut self.writer, &mut self.scratch, &msg, self.peer_ids).await
+    }
+
+    /// Write an arbitrary BT peer message (cover: Piece/Have/KeepAlive/…).
+    pub(crate) async fn send_message(&mut self, msg: &Message<'_>) -> Result<(), CarrierWireError> {
+        write_message(&mut self.writer, &mut self.scratch, msg, self.peer_ids).await
+    }
+}
+
+/// Owns the carrier reader half. Yields decoded BT messages one at a time; the
+/// caller routes `rq_tunnel` payloads and feeds other messages to
+/// `TunnelCarrierPeer`.
+pub(crate) struct CarrierReadHalf {
+    reader: BoxAsyncReadVectored,
+    read_buf: ReadBuf,
+}
+
+impl CarrierReadHalf {
+    /// Read exactly one BT peer message, BORROWING the internal read buffer.
+    /// `Ok(None)` on clean disconnect. The returned message borrows `self`, so
+    /// the caller must finish using it before the next call (streaming pattern,
+    /// identical to `recv_tunnel`'s internal loop). `Message` does NOT implement
+    /// `CloneToOwned`, so we do not attempt to return an owned `Message<'static>`.
+    pub(crate) async fn recv_message(&mut self) -> Result<Option<Message<'_>>, CarrierWireError> {
+        match self
+            .read_buf
+            .read_message(&mut self.reader, WIRE_TIMEOUT)
+            .await
+        {
+            Ok(m) => Ok(Some(m)),
+            Err(e) => {
+                tracing::debug!(error = %e, "carrier wire read ended");
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl CarrierWire {
+    /// Consume a post-establish `CarrierWire` into independently-owned halves
+    /// plus the `TunnelCarrierPeer` cover state machine.
+    pub(crate) fn into_halves(self) -> (CarrierReadHalf, CarrierWriteHalf, TunnelCarrierPeer) {
+        (
+            CarrierReadHalf {
+                reader: self.reader,
+                read_buf: self.read_buf,
+            },
+            CarrierWriteHalf {
+                writer: self.writer,
+                peer_ids: self.peer_ids,
+                scratch: vec![0u8; MAX_MSG_LEN],
+            },
+            self.carrier_peer,
+        )
+    }
+}
+
 enum Control {
     Continue,
     Disconnect,
@@ -332,5 +403,57 @@ mod tests {
         assert_eq!(&echoed[..], payload);
         let server_got = server.await.unwrap();
         assert_eq!(&server_got[..], payload);
+    }
+
+    #[tokio::test]
+    async fn split_halves_carry_tunnel_and_cover() {
+        let carrier = test_carrier().await;
+        let info_hash = carrier.descriptor().handshake_info_hash;
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+
+        let server_carrier = carrier.clone();
+        let server = tokio::spawn(async move {
+            let enc = PeerWireCrypto::responder(server_io, info_hash)
+                .await
+                .unwrap();
+            let wire = CarrierWire::establish(enc.reader, enc.writer, server_carrier, info_hash)
+                .await
+                .unwrap();
+            let (mut r, mut w, _peer) = wire.into_halves();
+            // Read one tunnel payload, echo it back as a tunnel payload.
+            loop {
+                match r.recv_message().await.unwrap() {
+                    Some(Message::Extended(ExtendedMessage::RqTunnel(rq))) => {
+                        let payload = rq.as_bytes().to_vec();
+                        w.send_tunnel(&payload).await.unwrap();
+                        break payload;
+                    }
+                    Some(_) => continue,
+                    None => panic!("server disconnected early"),
+                }
+            }
+        });
+
+        let enc = PeerWireCrypto::initiator(client_io, info_hash)
+            .await
+            .unwrap();
+        let wire = CarrierWire::establish(enc.reader, enc.writer, carrier, info_hash)
+            .await
+            .unwrap();
+        let (mut r, mut w, _peer) = wire.into_halves();
+
+        let payload = b"noise-blob".to_vec();
+        w.send_tunnel(&payload).await.unwrap();
+        let echoed = loop {
+            match r.recv_message().await.unwrap() {
+                Some(Message::Extended(ExtendedMessage::RqTunnel(rq))) => {
+                    break rq.as_bytes().to_vec();
+                }
+                Some(_) => continue,
+                None => panic!("client disconnected early"),
+            }
+        };
+        assert_eq!(echoed, payload);
+        assert_eq!(server.await.unwrap(), payload);
     }
 }
