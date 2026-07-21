@@ -445,7 +445,22 @@ async fn dispatch_actions<W: AsyncWrite + Unpin + ?Sized>(
     for action in actions {
         match action {
             CarrierAction::OutgoingMessage(msg) => {
-                write_message(writer, scratch, &msg.to_message(), peer_ids).await?;
+                // A cover message that can't SERIALIZE yet must NOT drop the
+                // connection — skip it, exactly like the steady-state cover lane
+                // (`relay.rs`) and `seed_until_promoted` (`server.rs`). The one
+                // reachable case is a `ut_metadata` response owed to a peer that
+                // sent a metadata `request` BEFORE its own BEP-10 handshake, so
+                // we don't yet know its `ut_metadata` id: serializing fails.
+                // Dropping there would be a pre-auth disconnect tell that no
+                // real client — nor our own bitfield/have/request cover —
+                // exhibits. Only a real write/IO failure aborts the handshake.
+                match write_message(writer, scratch, &msg.to_message(), peer_ids).await {
+                    Ok(()) => {}
+                    Err(CarrierWireError::Serialize(_)) => {
+                        tracing::debug!("skipping unserializable early cover message");
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             CarrierAction::Disconnect(reason) => {
                 tracing::debug!(%reason, "carrier peer requested disconnect");
@@ -463,6 +478,34 @@ mod tests {
     use super::*;
     use crate::tunnel::carrier::TunnelCarrierConfig;
     use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
+
+    #[tokio::test]
+    async fn dispatch_actions_skips_unserializable_cover_without_disconnect() {
+        // A ut_metadata response owed before we know the peer's extension ids
+        // (a peer that sent a metadata request before its BEP-10 handshake) can
+        // never serialize; `dispatch_actions` must SKIP it, not drop — otherwise
+        // that pre-handshake drop is an active-probe tell. Before the fix this
+        // returned `Err(Serialize)` and aborted `establish`.
+        use super::super::carrier_peer::{CarrierAction, CoverMessage};
+        let actions = vec![CarrierAction::OutgoingMessage(
+            CoverMessage::UtMetadataData {
+                piece: 0,
+                total_size: 4,
+                data: bytes::Bytes::from_static(b"info"),
+            },
+        )];
+        let mut scratch = vec![0u8; MAX_MSG_LEN];
+        let mut sink = tokio::io::sink();
+        let ctrl = dispatch_actions(
+            &mut sink,
+            &mut scratch,
+            actions,
+            PeerExtendedMessageIds::default(),
+        )
+        .await
+        .expect("unserializable cover must be skipped, not propagated");
+        assert!(matches!(ctrl, Control::Continue));
+    }
 
     async fn test_carrier() -> Arc<TunnelCarrierStore> {
         let dir = tempfile::TempDir::new().unwrap();
