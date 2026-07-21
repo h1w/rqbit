@@ -165,41 +165,69 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     hasher.finish()
 }
 
-/// Derive directional RC4 keys from the shared secret and carrier hash.
+/// Spec-accurate MSE/PE key derivation.
 ///
-/// Returns `(encrypt_key, decrypt_key)` — each 20 bytes.
-/// For the initiator: `encrypt_key` encrypts data TO the responder.
-/// For the responder: `encrypt_key` encrypts data TO the initiator.
-fn derive_rc4_keys(
-    shared_secret: &[u8; DH_KEY_BYTES],
-    carrier_hash: &Id20,
-    is_initiator: bool,
+/// `keyA = SHA1("keyA" || S || SKEY)` and `keyB = SHA1("keyB" || S || SKEY)`,
+/// where `S` is the 96-byte DH shared secret and `SKEY` is the 20-byte torrent
+/// info hash. Returns `(keyA, keyB)`.
+///
+/// Per the MSE spec the initiator (A) encrypts A->B with `keyA` and decrypts
+/// B->A with `keyB`; the responder (B) mirrors this (encrypt with `keyB`,
+/// decrypt with `keyA`).
+fn mse_keys(
+    s: &[u8; DH_KEY_BYTES],
+    skey: &[u8; RC4_KEY_LEN],
 ) -> ([u8; RC4_KEY_LEN], [u8; RC4_KEY_LEN]) {
-    // SKEY = SHA1(S)
-    let skey = sha1(shared_secret);
-
-    // req_seed = SHA1(SKEY || info_hash)
-    let mut req_input = Vec::with_capacity(40);
-    req_input.extend_from_slice(&skey);
-    req_input.extend_from_slice(&carrier_hash.0);
-    let req_seed = sha1(&req_input);
-
-    // Directional keys using "keyA" / "keyB" markers
-    let (local_marker, remote_marker) = if is_initiator {
-        (b"keyB", b"keyA") // Initiator: local=encrypt=keyB, remote=decrypt=keyA
-    } else {
-        (b"keyA", b"keyB") // Responder:  local=encrypt=keyA, remote=decrypt=keyB
+    let derive = |tag: &[u8; 4]| -> [u8; RC4_KEY_LEN] {
+        let mut input = Vec::with_capacity(tag.len() + DH_KEY_BYTES + RC4_KEY_LEN);
+        input.extend_from_slice(tag);
+        input.extend_from_slice(s);
+        input.extend_from_slice(skey);
+        sha1(&input)
     };
+    (derive(b"keyA"), derive(b"keyB"))
+}
 
-    let mut encrypt_input = req_seed.to_vec();
-    encrypt_input.extend_from_slice(local_marker);
-    let encrypt_key = sha1(&encrypt_input);
+/// `req1 = SHA1("req1" || S)` — the 20-byte hash of the shared secret.
+#[allow(dead_code)] // consumed by the handshake choreography in Task 2
+fn req1(s: &[u8; DH_KEY_BYTES]) -> [u8; 20] {
+    let mut input = Vec::with_capacity(4 + DH_KEY_BYTES);
+    input.extend_from_slice(b"req1");
+    input.extend_from_slice(s);
+    sha1(&input)
+}
 
-    let mut decrypt_input = req_seed.to_vec();
-    decrypt_input.extend_from_slice(remote_marker);
-    let decrypt_key = sha1(&decrypt_input);
+/// `req2 = SHA1("req2" || SKEY)` — the 20-byte hash of the info hash.
+#[allow(dead_code)] // consumed by the handshake choreography in Task 2
+fn req2(skey: &[u8; RC4_KEY_LEN]) -> [u8; 20] {
+    let mut input = Vec::with_capacity(4 + RC4_KEY_LEN);
+    input.extend_from_slice(b"req2");
+    input.extend_from_slice(skey);
+    sha1(&input)
+}
 
-    (encrypt_key, decrypt_key)
+/// `req3 = SHA1("req3" || S)` — the 20-byte hash of the shared secret.
+#[allow(dead_code)] // consumed by the handshake choreography in Task 2
+fn req3(s: &[u8; DH_KEY_BYTES]) -> [u8; 20] {
+    let mut input = Vec::with_capacity(4 + DH_KEY_BYTES);
+    input.extend_from_slice(b"req3");
+    input.extend_from_slice(s);
+    sha1(&input)
+}
+
+/// The MSE sync marker sent in the handshake: `req2(SKEY) xor req3(S)`.
+///
+/// A responder recovers `req2(SKEY)` from a received marker as
+/// `marker xor req3(S)`.
+#[allow(dead_code)] // consumed by the handshake choreography in Task 2
+fn sync_marker(skey: &[u8; RC4_KEY_LEN], s: &[u8; DH_KEY_BYTES]) -> [u8; 20] {
+    let a = req2(skey);
+    let b = req3(s);
+    let mut out = [0u8; 20];
+    for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
+        *o = x ^ y;
+    }
+    out
 }
 
 // ===========================================================================
@@ -420,8 +448,10 @@ where
             // Compute shared secret
             let secret = compute_shared_secret(&private, &peer_public);
 
-            // Derive keys
-            let (encrypt_key, decrypt_key) = derive_rc4_keys(&secret, &carrier_hash, true);
+            // Derive keys (spec-accurate MSE). Initiator encrypts A->B with
+            // keyA and decrypts B->A with keyB. Full choreography lands in Task 2.
+            let (key_a, key_b) = mse_keys(&secret, &carrier_hash.0);
+            let (encrypt_key, decrypt_key) = (key_a, key_b);
             let mut encrypt_cipher = new_rc4(&encrypt_key);
             let mut decrypt_cipher = new_rc4(&decrypt_key);
 
@@ -472,8 +502,10 @@ where
             let (private, public) = generate_dh_keypair();
             let secret = compute_shared_secret(&private, &initiator_public);
 
-            // Derive keys
-            let (encrypt_key, decrypt_key) = derive_rc4_keys(&secret, &carrier_hash, false);
+            // Derive keys (spec-accurate MSE). Responder mirrors the initiator:
+            // encrypt B->A with keyB and decrypt A->B with keyA.
+            let (key_a, key_b) = mse_keys(&secret, &carrier_hash.0);
+            let (encrypt_key, decrypt_key) = (key_b, key_a);
             let mut encrypt_cipher = new_rc4(&encrypt_key);
             let mut decrypt_cipher = new_rc4(&decrypt_key);
 
@@ -528,6 +560,105 @@ where
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    // ---- MSE key-derivation / marker conformance vectors -------------------
+
+    #[test]
+    fn mse_keys_match_spec_formula() {
+        let s = [0x11u8; DH_KEY_BYTES];
+        let skey = [0x22u8; RC4_KEY_LEN];
+
+        let (key_a, key_b) = mse_keys(&s, &skey);
+
+        // keyA = SHA1("keyA" || S || SKEY), rebuilt independently in the test.
+        let mut input_a = Vec::new();
+        input_a.extend_from_slice(b"keyA");
+        input_a.extend_from_slice(&s);
+        input_a.extend_from_slice(&skey);
+        assert_eq!(
+            key_a,
+            sha1(&input_a),
+            "keyA must equal SHA1(keyA || S || SKEY)"
+        );
+
+        // keyB = SHA1("keyB" || S || SKEY).
+        let mut input_b = Vec::new();
+        input_b.extend_from_slice(b"keyB");
+        input_b.extend_from_slice(&s);
+        input_b.extend_from_slice(&skey);
+        assert_eq!(
+            key_b,
+            sha1(&input_b),
+            "keyB must equal SHA1(keyB || S || SKEY)"
+        );
+
+        assert_ne!(key_a, key_b, "keyA and keyB must differ");
+
+        // Deterministic.
+        let (key_a2, key_b2) = mse_keys(&s, &skey);
+        assert_eq!(key_a, key_a2);
+        assert_eq!(key_b, key_b2);
+    }
+
+    #[test]
+    fn req_hashes_match_spec_and_are_distinct() {
+        let s = [0x33u8; DH_KEY_BYTES];
+        let skey = [0x44u8; RC4_KEY_LEN];
+
+        let r1 = req1(&s);
+        let r2 = req2(&skey);
+        let r3 = req3(&s);
+
+        // Each equals SHA1(tag || arg), rebuilt in the test.
+        let mut i1 = Vec::new();
+        i1.extend_from_slice(b"req1");
+        i1.extend_from_slice(&s);
+        assert_eq!(r1, sha1(&i1), "req1 must equal SHA1(req1 || S)");
+
+        let mut i2 = Vec::new();
+        i2.extend_from_slice(b"req2");
+        i2.extend_from_slice(&skey);
+        assert_eq!(r2, sha1(&i2), "req2 must equal SHA1(req2 || SKEY)");
+
+        let mut i3 = Vec::new();
+        i3.extend_from_slice(b"req3");
+        i3.extend_from_slice(&s);
+        assert_eq!(r3, sha1(&i3), "req3 must equal SHA1(req3 || S)");
+
+        // Distinct.
+        assert_ne!(r1, r2);
+        assert_ne!(r1, r3);
+        assert_ne!(r2, r3);
+
+        // Deterministic.
+        assert_eq!(r1, req1(&s));
+        assert_eq!(r2, req2(&skey));
+        assert_eq!(r3, req3(&s));
+    }
+
+    #[test]
+    fn sync_marker_is_req2_xor_req3_and_recoverable() {
+        let s = [0x55u8; DH_KEY_BYTES];
+        let skey = [0x66u8; RC4_KEY_LEN];
+
+        let marker = sync_marker(&skey, &s);
+        let r2 = req2(&skey);
+        let r3 = req3(&s);
+
+        // marker == req2 xor req3, byte-for-byte.
+        let mut expected = [0u8; 20];
+        for i in 0..20 {
+            expected[i] = r2[i] ^ r3[i];
+        }
+        assert_eq!(marker, expected, "sync_marker must be req2 XOR req3");
+
+        // Responder recovery: marker xor req3(S) == req2(SKEY).
+        let mut recovered = [0u8; 20];
+        for i in 0..20 {
+            recovered[i] = marker[i] ^ r3[i];
+        }
+        assert_eq!(recovered, r2, "marker XOR req3 must recover req2");
+    }
 
     #[tokio::test]
     async fn requires_encrypted_peer_wire_and_recovers_handshake_bytes() {
