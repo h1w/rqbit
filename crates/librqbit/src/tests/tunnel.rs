@@ -240,14 +240,31 @@ async fn client_rejects_wrong_server_key_before_sending_frames() {
     accept_handle.abort();
 }
 
-// ── Unknown client key rejection ────────────────────────────────────────────
+// ── Unknown client key: seeded, not dropped (Plan B active-probe resistance) ─
 
+/// A non-allowlisted client's Noise handshake must NOT drop the connection —
+/// `TunnelServer::accept` now serves BitTorrent cover until idle/disconnect
+/// and returns `AcceptOutcome::Seeded` (a normal outcome, not an admission
+/// error). This replaces the pre-Plan-B expectation of an immediate
+/// `NoiseHandshakeFailed` error, which was itself an active-probe tell (a
+/// censor could distinguish "handshake accepted, relay follows" from
+/// "handshake rejected, connection dropped").
+///
+/// Drives the CLIENT side manually (MSE initiator + `CarrierWire::establish`
+/// + a raw Noise IK initiator message with an unknown key) instead of
+/// `TunnelClient::connect`: with the new seed-and-never-drop behavior the
+/// server never replies to an unauthenticated peer, so `connect`'s blocking
+/// wait for a Noise reply would otherwise stall for its full per-read
+/// timeout. Disconnecting right after sending the bad Noise message lets the
+/// server observe it promptly instead of waiting out its idle timeout.
 #[tokio::test]
-async fn server_rejects_unknown_client_key_during_noise_handshake() {
-    use crate::tunnel::client::TunnelClient;
-    use crate::tunnel::crypto::generate_keypair;
+async fn server_seeds_unknown_client_key_instead_of_dropping() {
+    use crate::tunnel::carrier_chunk::chunk_ciphertext;
+    use crate::tunnel::carrier_wire::CarrierWire;
+    use crate::tunnel::crypto::{self, generate_keypair};
     use crate::tunnel::options::{EgressPolicy, TunnelServerOptions};
-    use crate::tunnel::server::TunnelServer;
+    use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
+    use crate::tunnel::server::{AcceptOutcome, TunnelServer};
     use librqbit_core::Id20;
     use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -280,11 +297,110 @@ async fn server_rejects_unknown_client_key_during_noise_handshake() {
         crate::tunnel::carrier_identity::build_carrier_store(&opts.carrier_root, &server_pk)
             .await
             .expect("build carrier store");
+    let info_hash = carrier_store.descriptor().handshake_info_hash;
+    let server = TunnelServer::new(opts, carrier_store.clone());
+
+    let server_clone = server.clone();
+    let accept_handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("listener accept");
+        let carrier_hash = Id20::new([0xAB; 20]);
+        server_clone.accept(stream, carrier_hash).await
+    });
+
+    let carrier_hash = Id20::new([0xAB; 20]);
+    let client_stream = tokio::net::TcpStream::connect(listen_addr)
+        .await
+        .expect("client TCP connect");
+    let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
+        .await
+        .expect("client MSE initiator");
+    // Same (correct) pinned server key, built from the server's OWN carrier
+    // store — so the carrier/BT handshake succeeds and the unknown key is
+    // only caught (well, no longer "caught": now silently un-promoted) at
+    // the Noise stage.
+    let wire = CarrierWire::establish(enc.reader, enc.writer, carrier_store, info_hash)
+        .await
+        .expect("client carrier establish");
+    let (mut read_half, mut write_half, _client_carrier_peer) = wire.into_halves();
+
+    // `establish()` only reads up to the PEER's extended handshake — it does
+    // not wait for the peer's subsequent initial cover (Bitfield/Unchoke/
+    // Interested), which the server writes symmetrically as the last step of
+    // its OWN `establish()`. Drain those 3 messages before disconnecting
+    // below: closing a socket that still has unread receive-buffered data
+    // sends a TCP RST (not a clean FIN), which would otherwise race the
+    // server's still-in-flight `establish()` writes and surface as a
+    // `CarrierHandshakeFailed` (broken pipe) from step 2 — a test artifact,
+    // not the `seed_until_promoted` (step 3) behavior this test exercises.
+    for _ in 0..3 {
+        read_half
+            .recv_message()
+            .await
+            .expect("recv server initial cover")
+            .expect("server initial cover message");
+    }
+
+    let (_handshake, noise_msg) =
+        crypto::initiator_start(&unknown_client_sk, &server_pk).expect("initiator_start");
+    for chunk in chunk_ciphertext(&noise_msg) {
+        write_half
+            .send_tunnel(&chunk)
+            .await
+            .expect("send noise init");
+    }
+
+    // No reply will ever come for this key — disconnect now rather than
+    // waiting on one, so the server observes the disconnect promptly.
+    drop(read_half);
+    drop(write_half);
+
+    let admission_result = accept_handle.await.expect("accept handle join");
+    assert!(
+        matches!(admission_result, Ok(AcceptOutcome::Seeded)),
+        "expected the unauthenticated peer to be Seeded (kept open and cover-served \
+         until disconnect), not dropped/errored"
+    );
+}
+
+/// Counterpart to the test above: a VALID allowlisted client must still yield
+/// `AcceptOutcome::Admitted` through the exact same `TunnelServer::accept`
+/// entry point — the seeder loop only changes what happens to peers that
+/// never present a valid Noise handshake.
+#[tokio::test]
+async fn server_admits_valid_allowlisted_client_via_accept() {
+    use crate::tunnel::client::TunnelClient;
+    use crate::tunnel::crypto::generate_keypair;
+    use crate::tunnel::options::{EgressPolicy, TunnelServerOptions};
+    use crate::tunnel::server::{AcceptOutcome, TunnelServer};
+    use librqbit_core::Id20;
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    let (server_sk, server_pk) = generate_keypair();
+    let (client_sk, client_pk) = generate_keypair();
+
+    let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let listen_addr = listener.local_addr().unwrap();
+
+    let mut allowed = HashSet::new();
+    allowed.insert(client_pk.clone());
+    let carrier_dir = tempfile::tempdir().expect("carrier temp dir");
+    let opts = TunnelServerOptions {
+        peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        identity_key: server_sk,
+        allowed_client_keys: allowed,
+        egress_policy: EgressPolicy::default(),
+        carrier_root: carrier_dir.path().to_path_buf(),
+    };
+
+    let carrier_store =
+        crate::tunnel::carrier_identity::build_carrier_store(&opts.carrier_root, &server_pk)
+            .await
+            .expect("build carrier store");
     let server = TunnelServer::new(opts, carrier_store);
 
-    // The client builds its own store from the (correct) pinned server key, so
-    // the carrier handshake succeeds and the unknown client key is caught at the
-    // Noise stage.
     let client_carrier_dir = tempfile::tempdir().expect("client carrier temp dir");
     let client_carrier_store =
         crate::tunnel::carrier_identity::build_carrier_store(client_carrier_dir.path(), &server_pk)
@@ -293,38 +409,290 @@ async fn server_rejects_unknown_client_key_during_noise_handshake() {
 
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let carrier_hash = Id20::new([0xAB; 20]);
-                server_clone.accept(stream, carrier_hash).await
-            }
-            Err(_) => Err(crate::tunnel::server::TunnelAdmissionError::PeerDisconnected),
-        }
+        let (stream, _) = listener.accept().await.expect("listener accept");
+        let carrier_hash = Id20::new([0xAB; 20]);
+        server_clone.accept(stream, carrier_hash).await
     });
 
     let carrier_hash = Id20::new([0xAB; 20]);
-    let connect_result = TunnelClient::connect(
+    let _client = TunnelClient::connect(
         listen_addr,
-        &unknown_client_sk,
+        &client_sk,
         &server_pk,
         carrier_hash,
         client_carrier_store,
     )
-    .await;
+    .await
+    .expect("valid allowlisted client must connect");
 
     let admission_result = accept_handle.await.expect("accept handle join");
-    assert!(
-        matches!(
-            admission_result,
-            Err(crate::tunnel::server::TunnelAdmissionError::NoiseHandshakeFailed(_))
-        ),
-        "expected admission rejection"
+    match admission_result {
+        Ok(AcceptOutcome::Admitted(peer)) => {
+            assert_eq!(
+                peer.client_key, client_pk,
+                "admitted with the wrong client key"
+            )
+        }
+        Ok(AcceptOutcome::Seeded) => {
+            panic!("valid allowlisted client must be Admitted, got Seeded")
+        }
+        Err(e) => panic!("valid allowlisted client must be Admitted, got admission error: {e}"),
+    }
+}
+
+// ── Plan B Task 3: full E2E active-probe-resistance gate ────────────────────
+
+/// THE end-to-end acceptance gate for "Plan B — Active-Probe Resistance": the
+/// server must behave exactly like an ordinary BitTorrent seeder to a plain,
+/// unauthenticated peer — never a hint that anything besides an ordinary BT
+/// peer connection is happening.
+///
+/// Drives a stub BT peer built from the exact same primitives
+/// `CarrierWire::establish` uses on the initiator side (mirrors
+/// `server_admits_valid_allowlisted_client_via_accept` above for how to stand
+/// up a real `TunnelServer` behind a real listener + `accept`, and
+/// `seed_until_promoted_keeps_seeding_after_invalid_noise_no_drop_tell` /
+/// `seed_until_promoted_promotes_on_valid_allowlisted_noise` in `server.rs`
+/// for the probe-request/garbage-Noise sequence). Unlike those two, this
+/// probe never presents ANY Noise handshake — valid or invalid — at all
+/// until after it has already downloaded and validated cover data; it is a
+/// genuinely ordinary peer, plus one active-probe attempt layered on top.
+///
+/// Two properties are proven, matching the "no tell" requirement exactly:
+///   1. The server serves real `Piece` data for a real `Request`, and that
+///      data byte-for-byte matches the deterministic carrier corpus (not a
+///      trivially-true "got *some* bytes back" check).
+///   2. Sending a garbage `rq_tunnel` payload (not a valid Noise IK initiator
+///      message) does NOT close the connection — a second `Request` still
+///      gets served within a bounded wait, and the eventual clean disconnect
+///      still yields `AcceptOutcome::Seeded` (ordinary BT churn), never an
+///      admission error.
+#[tokio::test]
+async fn active_probe_gets_seeded_and_stays_connected() {
+    use crate::tunnel::carrier::ValidPieceIndex;
+    use crate::tunnel::carrier_chunk::chunk_ciphertext;
+    use crate::tunnel::carrier_identity::build_carrier_store;
+    use crate::tunnel::carrier_wire::CarrierWire;
+    use crate::tunnel::config::CARRIER_PIECE_LENGTH;
+    use crate::tunnel::crypto::generate_keypair;
+    use crate::tunnel::options::{EgressPolicy, TunnelServerOptions};
+    use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
+    use crate::tunnel::server::{AcceptOutcome, TunnelServer};
+    use librqbit_core::Id20;
+    use peer_binary_protocol::{Message, Request};
+    use std::collections::HashSet;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::time::Duration;
+
+    crate::tests::test_util::setup_test_logging();
+
+    // Real server, with a real allowlist that does NOT contain any key the
+    // probe below will ever present — the probe never attempts a Noise
+    // handshake at all until the garbage-payload step, and even then it's
+    // garbage, not a real (if foreign) handshake. This is deliberately a
+    // stronger scenario than "wrong key": a plain BT peer/prober with zero
+    // tunnel-specific knowledge beyond the public carrier hash.
+    let (server_sk, server_pk) = generate_keypair();
+    let (_decoy_sk, decoy_pk) = generate_keypair();
+    let mut allowed = HashSet::new();
+    allowed.insert(decoy_pk);
+
+    let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let listen_addr = listener.local_addr().unwrap();
+
+    let carrier_dir = tempfile::tempdir().expect("carrier temp dir");
+    let opts = TunnelServerOptions {
+        peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+        identity_key: server_sk,
+        allowed_client_keys: allowed,
+        egress_policy: EgressPolicy::default(),
+        carrier_root: carrier_dir.path().to_path_buf(),
+    };
+    let carrier_store =
+        crate::tunnel::carrier_identity::build_carrier_store(&opts.carrier_root, &server_pk)
+            .await
+            .expect("build server carrier store");
+    let info_hash = carrier_store.descriptor().handshake_info_hash;
+    let server = TunnelServer::new(opts, carrier_store);
+
+    let server_clone = server.clone();
+    let accept_handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("listener accept");
+        let carrier_hash = Id20::new([0xAB; 20]);
+        server_clone.accept(stream, carrier_hash).await
+    });
+
+    // ── Stub BitTorrent peer ("plain, unauthenticated") ─────────────────────
+    // Exactly the primitives `CarrierWire::establish` uses on the initiator
+    // side: MSE-initiate keyed by the (public) carrier hash, then complete
+    // the real BT handshake + BEP-10 extended handshake. Nothing beyond that
+    // is tunnel-specific — a genuine BT client (or a censor's active probe)
+    // connecting to any discovered peer looks exactly like this.
+    let carrier_hash = Id20::new([0xAB; 20]);
+    let probe_stream = tokio::net::TcpStream::connect(listen_addr)
+        .await
+        .expect("probe TCP connect");
+    let enc = PeerWireCrypto::initiator(probe_stream, carrier_hash)
+        .await
+        .expect("probe MSE initiator");
+
+    // The probe's own independent copy of the carrier store: both endpoints
+    // derive a BYTE-IDENTICAL synthetic corpus from the same `server_pk` with
+    // no exchange (see `carrier_identity::build_carrier_store`), so a fresh
+    // local store built here is the same corpus the server serves pieces
+    // from — this is what lets the test validate served bytes genuinely.
+    let probe_carrier_dir = tempfile::tempdir().expect("probe carrier temp dir");
+    let probe_carrier_store = build_carrier_store(probe_carrier_dir.path(), &server_pk)
+        .await
+        .expect("build probe carrier store");
+
+    let wire = CarrierWire::establish(
+        enc.reader,
+        enc.writer,
+        probe_carrier_store.clone(),
+        info_hash,
+    )
+    .await
+    .expect("probe carrier establish");
+    let (mut read_half, mut write_half, _probe_carrier_peer) = wire.into_halves();
+
+    // Ordinary BT etiquette: announce interest, then request piece 0 block 0
+    // (16 KiB) — exactly what a normal downloading peer does, with no tunnel
+    // framing (`rq_tunnel`) involved whatsoever.
+    write_half
+        .send_message(&Message::Interested)
+        .await
+        .expect("send Interested");
+    write_half
+        .send_message(&Message::Request(Request::new(0, 0, 16384)))
+        .await
+        .expect("send first Request");
+
+    // `CarrierWire::establish` (initiator side) does not wait to read the
+    // peer's own trailing initial cover (Bitfield/Unchoke/Interested) that the
+    // server's `establish()` writes as its last step — see
+    // `server_seeds_unknown_client_key_instead_of_dropping`'s comment for the
+    // same wrinkle — so skip any of that leading cover while waiting for the
+    // `Piece` response. Bounded so a regression (server silently drops
+    // instead of serving) fails fast instead of hanging the test.
+    let first_block = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match read_half
+                .recv_message()
+                .await
+                .expect("recv (first Request)")
+            {
+                Some(Message::Piece(p)) => {
+                    assert_eq!(p.index, 0, "expected Piece for index 0");
+                    assert_eq!(p.begin, 0, "expected Piece at begin 0");
+                    // The ring-buffer reader (`read_buf.rs`) may split a
+                    // message across two slices when it wraps around the
+                    // fixed-size buffer, which for `Piece` surfaces as a
+                    // non-empty `block_1` — concatenate both halves rather
+                    // than reading only `block_0` (matches how
+                    // `carrier_peer.rs::on_piece` treats the two halves).
+                    let (b0, b1) = p.data();
+                    let mut block = Vec::with_capacity(b0.len() + b1.len());
+                    block.extend_from_slice(b0);
+                    block.extend_from_slice(b1);
+                    break block;
+                }
+                Some(_) => continue,
+                None => panic!("server disconnected instead of serving the first Request"),
+            }
+        }
+    })
+    .await
+    .expect("server must serve a Piece for an ordinary Request within a bounded wait");
+
+    // Validate the returned bytes genuinely: read the SAME piece from the
+    // shared deterministic carrier corpus and compare the actual block range
+    // — not a trivially-true check like `!first_block.is_empty()`.
+    let mut expected_piece = vec![0u8; CARRIER_PIECE_LENGTH as usize];
+    probe_carrier_store
+        .read_piece(ValidPieceIndex(0), &mut expected_piece)
+        .await
+        .expect("read piece 0 from probe carrier store");
+    assert_eq!(
+        first_block,
+        expected_piece[0..16384],
+        "served Piece block does not match the deterministic carrier corpus"
     );
 
-    assert!(
-        connect_result.is_err(),
-        "expected client connect to fail with unknown client key"
+    // ── The anti-tell: garbage rq_tunnel bytes must not drop the connection ──
+    // Not a valid Noise IK initiator message (arbitrary bytes, far too short
+    // and structurally wrong) — exactly what an active prober would send to
+    // fingerprint the tunnel: foreign/garbage bytes over what looks like an
+    // `rq_tunnel` extended message, watching whether the peer disconnects.
+    let garbage: Vec<u8> = (0..96u8)
+        .map(|i| i.wrapping_mul(37).wrapping_add(11))
+        .collect();
+    for chunk in chunk_ciphertext(&garbage) {
+        write_half
+            .send_tunnel(&chunk)
+            .await
+            .expect("send garbage rq_tunnel payload");
+    }
+
+    // A second, ordinary Request must still be served within a bounded wait —
+    // proof the connection was never closed/dropped in response to the
+    // garbage (the removed disconnect-tell).
+    write_half
+        .send_message(&Message::Request(Request::new(0, 0, 16384)))
+        .await
+        .expect("send second Request");
+
+    let second_block = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match read_half
+                .recv_message()
+                .await
+                .expect("recv (second Request)")
+            {
+                Some(Message::Piece(p)) => {
+                    // See the matching comment on the first Request above: a
+                    // large message may wrap the fixed-size ring buffer and
+                    // split into two slices.
+                    let (b0, b1) = p.data();
+                    let mut block = Vec::with_capacity(b0.len() + b1.len());
+                    block.extend_from_slice(b0);
+                    block.extend_from_slice(b1);
+                    break block;
+                }
+                Some(_) => continue,
+                None => panic!(
+                    "server disconnected after garbage rq_tunnel bytes — active-probe tell \
+                     regression: the connection must stay open"
+                ),
+            }
+        }
+    })
+    .await
+    .expect("server must still be seeding within a bounded wait after garbage rq_tunnel bytes");
+
+    assert_eq!(
+        second_block,
+        expected_piece[0..16384],
+        "second served Piece block does not match the deterministic carrier corpus"
     );
+
+    // Disconnect and confirm the server treats this exactly like ordinary BT
+    // churn: `Seeded`, never an admission error — the probe never presented
+    // ANY Noise handshake, valid or otherwise.
+    drop(read_half);
+    drop(write_half);
+
+    match accept_handle.await.expect("accept handle join") {
+        Ok(AcceptOutcome::Seeded) => {}
+        Ok(AcceptOutcome::Admitted(_)) => {
+            panic!("expected AcceptOutcome::Seeded for a never-authenticated probe, got Admitted")
+        }
+        Err(e) => panic!(
+            "expected AcceptOutcome::Seeded for a never-authenticated probe, got admission error: {e}"
+        ),
+    }
 }
 
 // ── Peer loss handling ──────────────────────────────────────────────────────
