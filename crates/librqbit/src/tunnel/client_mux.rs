@@ -111,6 +111,10 @@ impl ClientMux {
         // Cover lane: the reader funnels inbound piece Request→Piece cover here
         // and the writer task drains it (unpaced, below control priority).
         let (cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
+        // Minimal piece cover so the carrier exhibits real BT Request/Piece
+        // traffic (Plan C elaborates the cadence). Cloned here, before
+        // `cover_tx` is moved into `reader_loop` below.
+        let cover_seed = cover_tx.clone();
         // ONE pacing-rate cell shared by the writer (which re-reads it per
         // frame) and the control task below (which drives it to `target / rtt`).
         // Seeded at the effectively-unlimited default until the first RTT
@@ -176,6 +180,20 @@ impl ClientMux {
             pacing_rate,
             shutdown,
         ));
+
+        // Minimal piece cover so the carrier exhibits real BT Request/Piece
+        // traffic (Plan C elaborates the cadence). Requests reference real
+        // pieces of the synthetic carrier torrent; the server answers with
+        // validated Piece messages.
+        tokio::spawn(async move {
+            for idx in 0u32..2 {
+                let _ = cover_seed
+                    .send(Message::Request(peer_binary_protocol::Request::new(
+                        idx, 0, 16384,
+                    )))
+                    .await;
+            }
+        });
 
         mux
     }

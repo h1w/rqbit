@@ -66,9 +66,12 @@ pub(crate) struct TunnelClient {
     /// Reassembles chunked Noise ciphertext from `rq_tunnel` messages. Only used
     /// by the (test-only) blocking [`read_frame`](Self::read_frame); in
     /// production the client is consumed by [`into_carrier`](Self::into_carrier)
-    /// immediately after connecting.
+    /// immediately after connecting, so this field would otherwise be
+    /// write-only in production builds.
+    #[cfg(test)]
     defrag: super::carrier_chunk::CarrierDefragmenter,
     /// Decoded-but-not-yet-returned ciphertext blobs for the blocking reader.
+    #[cfg(test)]
     pending: std::collections::VecDeque<Vec<u8>>,
     /// Next stream ID (even numbers for client-initiated).
     next_stream_id: AtomicU64,
@@ -126,7 +129,9 @@ impl TunnelClient {
             read_half,
             write_half,
             carrier_peer,
+            #[cfg(test)]
             defrag,
+            #[cfg(test)]
             pending: std::collections::VecDeque::new(),
             next_stream_id: AtomicU64::new(1),
             next_assoc_id: AtomicU64::new(1),

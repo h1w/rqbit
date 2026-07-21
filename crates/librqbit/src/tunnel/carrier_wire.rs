@@ -20,6 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use bytes::Bytes;
 use librqbit_core::Id20;
 use peer_binary_protocol::extended::ExtendedMessage;
@@ -84,6 +85,50 @@ fn make_peer_id() -> Id20 {
     Id20::new(id)
 }
 
+// ── Test-only message-level trace tap ───────────────────────────────────────
+//
+// `write_message` (below) is the single outgoing serialization choke point —
+// used by `establish`, `send_tunnel`, and `send_message` alike — so tapping it
+// here captures every BT message either carrier endpoint puts on the wire.
+// Tunnel tests run on the current-thread runtime (`#[tokio::test]`, not
+// `flavor = "multi_thread"`), so all spawned relay tasks for a given test
+// share one OS thread and a `thread_local!` sink is visible to both the
+// client and server tasks within that same test.
+
+#[cfg(test)]
+thread_local! {
+    static CARRIER_TRACE: std::cell::RefCell<Option<std::sync::Arc<parking_lot::Mutex<super::test_capture::CarrierTrace>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: install a trace sink for this thread. Returns the handle to read
+/// later.
+#[cfg(test)]
+pub(crate) fn install_carrier_trace()
+-> std::sync::Arc<parking_lot::Mutex<super::test_capture::CarrierTrace>> {
+    let sink = std::sync::Arc::new(parking_lot::Mutex::new(
+        super::test_capture::CarrierTrace::new(),
+    ));
+    CARRIER_TRACE.with(|c| *c.borrow_mut() = Some(sink.clone()));
+    sink
+}
+
+/// Test-only: remove this thread's trace sink (if any).
+#[cfg(test)]
+pub(crate) fn clear_carrier_trace() {
+    CARRIER_TRACE.with(|c| *c.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn record_carrier_event(msg: &Message<'_>) {
+    CARRIER_TRACE.with(|c| {
+        if let Some(sink) = c.borrow().as_ref() {
+            sink.lock()
+                .push(super::test_capture::CarrierEvent::from_message(msg));
+        }
+    });
+}
+
 /// Serialize `msg` and write it to `writer`.
 async fn write_message<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
@@ -91,6 +136,8 @@ async fn write_message<W: AsyncWrite + Unpin + ?Sized>(
     msg: &Message<'_>,
     peer_ids: PeerExtendedMessageIds,
 ) -> Result<(), CarrierWireError> {
+    #[cfg(test)]
+    record_carrier_event(msg);
     let len = msg
         .serialize(scratch, &|| peer_ids)
         .map_err(|e| CarrierWireError::Serialize(format!("{e:?}")))?;
@@ -201,6 +248,13 @@ impl CarrierWire {
     }
 
     /// Send an opaque tunnel payload as an `rq_tunnel` extended message.
+    ///
+    /// Test-only: production always immediately splits a freshly-established
+    /// `CarrierWire` via [`into_halves`](Self::into_halves) and drives
+    /// [`CarrierWriteHalf::send_tunnel`] from there instead, so this
+    /// whole-`CarrierWire` convenience method is only exercised directly by
+    /// this module's own tests below.
+    #[cfg(test)]
     pub(crate) async fn send_tunnel(&mut self, payload: &[u8]) -> Result<(), CarrierWireError> {
         let mut scratch = vec![0u8; MAX_MSG_LEN];
         let msg = Message::Extended(ExtendedMessage::RqTunnel(RqTunnelMessage::from_bytes(
@@ -211,6 +265,10 @@ impl CarrierWire {
 
     /// Read peer messages, handling cover traffic inline, until the next
     /// `rq_tunnel` payload arrives. Returns `None` on disconnect.
+    ///
+    /// Test-only: see [`send_tunnel`](Self::send_tunnel) — production drives
+    /// [`CarrierReadHalf::recv_message`] instead.
+    #[cfg(test)]
     pub(crate) async fn recv_tunnel(&mut self) -> Result<Option<Bytes>, CarrierWireError> {
         let mut scratch = vec![0u8; MAX_MSG_LEN];
         loop {

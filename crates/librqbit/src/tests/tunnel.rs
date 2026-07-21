@@ -1470,3 +1470,129 @@ async fn carrier_pool_reflects_full_carrier_loss() {
         "pick() must return None once every carrier is gone"
     );
 }
+
+// ── Capture E2E gate: real BT events on the wire ────────────────────────────
+
+/// Prove the live tunnel actually emits real BitTorrent protocol messages
+/// (BEP-10 extended handshake, bitfield, piece cover), not just opaque
+/// framing. The masquerade sits INSIDE the MSE/RC4-encrypted stream (exactly
+/// like a real encrypted BT peer), so a raw byte capture can't see BT
+/// messages — this taps at the MESSAGE layer instead, via the `#[cfg(test)]`
+/// thread-local `CarrierTrace` sink installed on `carrier_wire::write_message`
+/// (the single outgoing serialization choke point used by both the client and
+/// server carrier halves).
+///
+/// Mirrors `build_real_relay_pair` + `ClientMux::new` + the production
+/// `run_server_relay` from `real_relay_transfers_large_payload_with_flow_control`
+/// above (a real Noise-encrypted client/server pair) rather than the
+/// `TunnelFixture` echo harness: piece cover (`Request`/`Piece`) only flows
+/// through the cover-seed task wired into `ClientMux::new`, so the mux path is
+/// the one that actually exercises it.
+///
+/// MUST run on the current-thread runtime (`#[tokio::test]`, no
+/// `flavor = "multi_thread"`): the thread-local trace is only visible to tasks
+/// scheduled on this one thread, which is exactly how every relay/writer/
+/// reader task spawned by a current-thread runtime executes.
+#[tokio::test]
+async fn wire_shows_real_bittorrent_events() {
+    use crate::tunnel::carrier_wire::{clear_carrier_trace, install_carrier_trace};
+    use crate::tunnel::client_mux::{ClientMux, InboundTcp};
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use crate::tunnel::test_capture::CarrierEvent;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    // Install the tap BEFORE any carrier handshake runs, so it observes the
+    // BEP-10 extended handshake + bitfield from `build_real_relay_pair` below.
+    let trace = install_carrier_trace();
+
+    // Real loopback echo destination for a small SOCKS-style TCP round trip.
+    let echo = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+
+    // `ClientMux::new` is where the minimal piece-cover seed task lives (Part
+    // A), so it MUST be on the path for Request/Piece traffic to appear.
+    let mux = ClientMux::new(client, token.clone());
+
+    let (stream_id, mut inbound, credit) = mux
+        .open_tcp(TunnelDestination::Ip(echo_addr))
+        .await
+        .expect("open_tcp");
+    match inbound.recv().await {
+        Some(InboundTcp::Opened(_)) => {}
+        _ => panic!("expected TcpOpened verdict, stream was not established"),
+    }
+
+    let payload = Bytes::from_static(b"capture-e2e");
+    assert!(
+        credit.reserve(payload.len()).await,
+        "credit pool closed before send"
+    );
+    assert!(
+        mux.send_tcp_data(stream_id, payload.clone()).await,
+        "send_tcp_data failed"
+    );
+    match inbound.recv().await {
+        Some(InboundTcp::Data(bytes)) => assert_eq!(&bytes[..], &payload[..]),
+        Some(InboundTcp::Opened(_)) => panic!("expected TcpData echo, got duplicate Opened"),
+        Some(InboundTcp::Fin) => panic!("expected TcpData echo, got Fin"),
+        Some(InboundTcp::Reset(code)) => panic!("expected TcpData echo, got Reset({code:?})"),
+        None => panic!("expected TcpData echo, got None (tunnel lost)"),
+    }
+
+    // The cover-seed task and both writers run as separate spawned tasks on
+    // this same current thread; poll (bounded) until their Request/Piece
+    // traffic has actually been written and observed by the tap.
+    crate::tests::test_util::wait_until(
+        || {
+            let events = trace.lock().events().to_vec();
+            if events.contains(&CarrierEvent::Request) || events.contains(&CarrierEvent::Piece) {
+                Ok(())
+            } else {
+                anyhow::bail!("no piece cover observed yet: {events:?}")
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("piece cover (Request/Piece) should appear on the wire");
+
+    let events = trace.lock().events().to_vec();
+    clear_carrier_trace();
+    token.cancel();
+
+    assert!(
+        events.contains(&CarrierEvent::ExtendedHandshake),
+        "no BEP-10 extended handshake on wire: {events:?}"
+    );
+    assert!(
+        events.contains(&CarrierEvent::Bitfield),
+        "no bitfield on wire: {events:?}"
+    );
+    assert!(
+        events.contains(&CarrierEvent::Piece) || events.contains(&CarrierEvent::Request),
+        "no piece cover (Request/Piece) on wire: {events:?}"
+    );
+}
