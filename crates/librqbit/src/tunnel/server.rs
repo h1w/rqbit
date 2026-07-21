@@ -208,14 +208,19 @@ struct SeederConnGuard {
 
 impl Drop for SeederConnGuard {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.counts.lock() {
-            if let Some(n) = map.get_mut(&self.ip) {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    map.remove(&self.ip);
-                }
+        // Recover from a poisoned lock (matching the admit path) so a prior
+        // panic elsewhere can never leak this IP's per-connection count.
+        let mut map = match self.counts.lock() {
+            Ok(m) => m,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(n) = map.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.ip);
             }
         }
+        drop(map);
         self.total.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -387,6 +392,11 @@ impl TunnelServer {
         .await?
         {
             Some((transport, client_key)) => {
+                // Clear any transient pre-auth choke (from losing the optimistic
+                // upload-slot race) so the now-authenticated connection serves
+                // its post-auth cover Request/Piece traffic normally in the
+                // relay — the pre-auth slot bound does not apply post-promotion.
+                carrier_peer.set_local_choked(false);
                 self.peers.write().await.insert(client_key.clone(), true);
                 Ok(AcceptOutcome::Admitted(Box::new(AdmittedPeer {
                     client_key,
