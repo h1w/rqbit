@@ -1057,6 +1057,12 @@ async fn build_real_relay_pair() -> (
         for chunk in chunk_ciphertext(&reply) {
             write_half.send_tunnel(&chunk).await.unwrap();
         }
+        // Mirror `TunnelServer::accept`'s promotion step: an admitted peer is
+        // authenticated, so `on_request` must skip the pre-auth pieces
+        // self-choke — otherwise the ongoing cover cadence would eventually
+        // (past `MAX_SEEDER_PIECES_PER_CONN`) choke a long-lived relay carrier.
+        let mut carrier_peer = carrier_peer;
+        carrier_peer.set_authenticated(true);
         AdmittedPeer {
             client_key,
             transport,
@@ -1973,5 +1979,169 @@ async fn wire_shows_real_bittorrent_events() {
     assert!(
         events.contains(&CarrierEvent::Piece) || events.contains(&CarrierEvent::Request),
         "no piece cover (Request/Piece) on wire: {events:?}"
+    );
+}
+
+// ── Plan C cadence gate: steady-state carrier profile ───────────────────────
+
+/// Plan C Task 3 (final): assert the live carrier's wire cadence has the
+/// STRUCTURAL shape of a real BitTorrent client over a bounded window, not the
+/// one-shot startup burst of earlier plans. Over a live tunnel (real
+/// Noise-encrypted `build_real_relay_pair` + production `ClientMux` + server
+/// relay), tapped at the message layer via the `CarrierTrace` sink, we assert:
+///
+///   (a) the extended handshake advertised `ut_metadata` + a non-zero
+///       `metadata_size` (BEP-9),
+///   (b) at least one served `ut_metadata` `data` response after the peer
+///       requested metadata,
+///   (c) a `KeepAlive` within `KEEPALIVE_INTERVAL` on an otherwise-idle
+///       connection, and
+///   (d) ONGOING `Request`/`Piece` cover ACROSS the window — many more than the
+///       old one-time 2-request burst, accruing purely as time advances past
+///       startup (proof of a periodic cadence, not a startup burst).
+///
+/// These are structural cadence properties; a full statistical / reference-pcap
+/// match is Plan F, not this gate.
+///
+/// MUST be current-thread (`#[tokio::test]`): the thread-local trace is only
+/// visible to tasks scheduled on this one worker. `start_paused` freezes the
+/// clock so the 3 s cover cadence and 110 s keepalive are driven with
+/// `tokio::time::advance` instead of real waits. The carrier's cover traffic is
+/// NOT time-gated (it flows over the in-memory duplex via task scheduling), so
+/// yielding between advances lets each `Request`→`Piece` round trip complete.
+#[tokio::test(start_paused = true)]
+async fn carrier_cadence_matches_a_real_client_profile() {
+    use crate::tunnel::carrier_wire::{clear_carrier_trace, install_carrier_trace};
+    use crate::tunnel::client_mux::ClientMux;
+    use crate::tunnel::config::{COVER_REQUEST_INTERVAL, KEEPALIVE_INTERVAL};
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use crate::tunnel::test_capture::{CarrierEvent, CarrierTrace};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    // Install the tap BEFORE any carrier handshake runs so it observes the
+    // BEP-10 extended handshake (with its `ut_metadata`/`metadata_size`).
+    let trace = install_carrier_trace();
+    struct ClearTraceGuard;
+    impl Drop for ClearTraceGuard {
+        fn drop(&mut self) {
+            clear_carrier_trace();
+        }
+    }
+    let _clear_trace_guard = ClearTraceGuard;
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+
+    // `ClientMux::new` starts the ongoing cover-request cadence + keepalive.
+    let _mux = ClientMux::new(client, token.clone());
+
+    // Yield helper: keep THIS task runnable so the paused clock never
+    // auto-advances, while letting the spawned reader/writer/cadence tasks run.
+    async fn pump() {
+        for _ in 0..24 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let count = |trace: &Arc<parking_lot::Mutex<CarrierTrace>>, kind: CarrierEvent| {
+        trace.lock().events().iter().filter(|e| **e == kind).count()
+    };
+
+    // Let startup traffic settle (the immediate first cover tick + the one-time
+    // ut_metadata request), then snapshot the Request count at ~t=0.
+    pump().await;
+    let requests_at_startup = count(&trace, CarrierEvent::Request);
+
+    // Drive the window well past the keepalive interval, one cover interval at a
+    // time, pumping between advances so each Request→Piece round trip lands.
+    // 45 * 3 s = 135 s comfortably exceeds KEEPALIVE_INTERVAL (110 s) and yields
+    // ~45 ongoing cover requests — far more than the old 2-request burst.
+    let steps = 45u32;
+    assert!(
+        (steps as u64) * COVER_REQUEST_INTERVAL.as_secs()
+            > KEEPALIVE_INTERVAL.as_secs() + Duration::from_secs(10).as_secs(),
+        "test window must exceed KEEPALIVE_INTERVAL so a keepalive is observed"
+    );
+    for _ in 0..steps {
+        tokio::time::advance(COVER_REQUEST_INTERVAL).await;
+        pump().await;
+    }
+    // A final pump so the last in-flight round trips are recorded.
+    pump().await;
+
+    let events = trace.lock().events().to_vec();
+    token.cancel();
+
+    // (a) The extended handshake advertised ut_metadata + a non-zero
+    // metadata_size (BEP-9) — a payload fact retained by the trace tap.
+    {
+        let t = trace.lock();
+        assert!(
+            t.advertised_ut_metadata(),
+            "extended handshake must advertise ut_metadata"
+        );
+        assert!(
+            t.advertised_metadata_size() > 0,
+            "extended handshake must advertise a non-zero metadata_size, got {}",
+            t.advertised_metadata_size()
+        );
+    }
+
+    // (b) At least one served ut_metadata data response, after the peer's
+    // request. The client's one-time UtMetadataRequest must precede the
+    // server's UtMetadataData in the observed order.
+    assert!(
+        events.contains(&CarrierEvent::UtMetadataRequest),
+        "carrier must issue a ut_metadata request: {events:?}"
+    );
+    assert!(
+        events.contains(&CarrierEvent::UtMetadataData),
+        "server must serve a ut_metadata data response: {events:?}"
+    );
+    let first_req = events
+        .iter()
+        .position(|e| *e == CarrierEvent::UtMetadataRequest);
+    let first_data = events
+        .iter()
+        .position(|e| *e == CarrierEvent::UtMetadataData);
+    assert!(
+        matches!((first_req, first_data), (Some(r), Some(d)) if d > r),
+        "a served ut_metadata data must come AFTER the peer requests metadata \
+         (req at {first_req:?}, data at {first_data:?})"
+    );
+
+    // (c) A KeepAlive within KEEPALIVE_INTERVAL on the idle connection.
+    assert!(
+        events.contains(&CarrierEvent::KeepAlive),
+        "an idle carrier must emit a BT KeepAlive within KEEPALIVE_INTERVAL: {events:?}"
+    );
+
+    // (d) Ongoing Request/Piece cover ACROSS the window — far more than the old
+    // one-time 2-request burst, and demonstrably accrued as time advanced past
+    // startup (not merely at connect).
+    let requests_total = count(&trace, CarrierEvent::Request);
+    let pieces_total = count(&trace, CarrierEvent::Piece);
+    assert!(
+        requests_total > 2,
+        "cover must be ONGOING (more than the old 2-request burst), got {requests_total}"
+    );
+    assert!(
+        requests_total >= requests_at_startup + 10,
+        "cover requests must keep accruing as time advances past startup \
+         (startup={requests_at_startup}, total={requests_total})"
+    );
+    assert!(
+        pieces_total >= 10,
+        "the authenticated server must keep serving ongoing Piece cover without \
+         self-choking, got {pieces_total} pieces"
     );
 }

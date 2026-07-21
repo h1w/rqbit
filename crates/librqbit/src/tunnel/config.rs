@@ -171,6 +171,65 @@ pub(crate) const PACING_BURST: u64 = 256 * 1024;
 /// this much, so forward progress (and thus fresh RTT samples) is guaranteed.
 pub(crate) const MIN_PACING_RATE: u64 = MIN_TARGET as u64;
 
+// ── Keepalive cadence (carrier realism) ─────────────────────────────────────
+
+/// How often the carrier writer sends a BitTorrent `KeepAlive` on an otherwise
+/// idle-but-open connection. A real BT client sends a keepalive roughly every
+/// ~2 min of idle (the de-facto convention is ~110–120 s, comfortably under the
+/// common 2-minute peer inactivity drop), so a quiet open masquerade connection
+/// must do the same — a passive observer watching a silent open connection that
+/// never sends a keepalive would have a tell that no real peer exhibits. The
+/// writer emits one on every interval tick regardless of activity: a keepalive
+/// on a busy connection is harmless and realistic, and it is a plain BT message
+/// (NOT a tunnel frame), so it never touches `NoiseTransport` / the Noise
+/// sequence. Best-effort and lowest priority — below control, data, and cover.
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(110);
+
+// ── Cover-request cadence (carrier realism) ──────────────────────────────────
+
+/// How often the client mux issues a fresh BitTorrent piece `Request` on an
+/// active carrier so the connection exhibits ONGOING piece exchange, not a
+/// single startup burst. A real leeching BT peer keeps a steady pipeline of
+/// block requests in flight for the whole session; a masquerade carrier that
+/// fires two `Request`s at connect and then goes silent (for BT purposes) while
+/// still streaming encrypted `rq_tunnel` payload would have a tell no real
+/// downloading peer exhibits. The cadence is best-effort (`try_send`, dropped
+/// on a full cover lane — it's cover) and cheap: one small block request per
+/// tick. Kept short enough to look like an active download without adding
+/// meaningful load. The server answers each with a validated `Piece`.
+pub(crate) const COVER_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Block length (bytes) of each cover `Request` — the de-facto BitTorrent block
+/// size (16 KiB), matching `READ_CHUNK`. A real client requests pieces one
+/// 16 KiB block at a time.
+pub(crate) const COVER_REQUEST_BLOCK_LEN: u32 = 16 * 1024;
+
+/// Number of distinct low piece indices the cover cadence rotates its
+/// `Request`s across. Every synthetic carrier has at least
+/// `CARRIER_CORPUS_MIN / CARRIER_PIECE_LENGTH` pieces
+/// (`8 MiB / 256 KiB = 32`), so any index below this span is ALWAYS in range
+/// for any carrier the client could be talking to — the cadence never needs to
+/// know the exact corpus size to stay in-bounds. Rotating (rather than always
+/// hammering piece 0) looks like a client fetching different parts of the file.
+pub(crate) const COVER_REQUEST_PIECE_SPAN: u32 = 8;
+
+/// Number of 16 KiB blocks in one carrier piece
+/// (`CARRIER_PIECE_LENGTH / COVER_REQUEST_BLOCK_LEN = 16`). The cadence rotates
+/// the block offset within each piece across this many blocks so successive
+/// requests to the same piece walk its blocks like a real download, and every
+/// `(begin, length)` pair stays within `CARRIER_PIECE_LENGTH`.
+pub(crate) const COVER_REQUEST_BLOCKS_PER_PIECE: u32 =
+    CARRIER_PIECE_LENGTH / COVER_REQUEST_BLOCK_LEN;
+
+// The cover cadence's `begin + length` must never exceed a carrier piece, or
+// `TunnelCarrierPeer::on_request` rejects the request as an overflow. This
+// compile-time check makes the block-walking arithmetic un-rottable.
+const _: () = assert!(
+    (COVER_REQUEST_BLOCKS_PER_PIECE - 1) * COVER_REQUEST_BLOCK_LEN + COVER_REQUEST_BLOCK_LEN
+        <= CARRIER_PIECE_LENGTH,
+    "cover-request block walk must stay within CARRIER_PIECE_LENGTH"
+);
+
 // ── Carriers ─────────────────────────────────────────────────────────────────
 
 /// Default number of parallel carrier connections a client opens to the server.
@@ -263,6 +322,34 @@ pub(crate) const NOISE_INIT_MAX: usize = 160;
 /// KEEP SEEDING (no drop, no tell). Hard bound: ≤ `MAX_NOISE_ATTEMPTS` X25519
 /// ops per connection.
 pub(crate) const MAX_NOISE_ATTEMPTS: usize = 8;
+
+// ── Metadata (ut_metadata / BEP-9) serving ──────────────────────────────────
+
+/// BEP-9 chunks the info dict into pieces of this size (16 KiB) — the same
+/// value as `librqbit_core::constants::CHUNK_SIZE`, which
+/// `UtMetadataData::validate` enforces on the wire for the LAST piece's exact
+/// remainder size too. Kept as its own named constant here (rather than
+/// importing the shared one directly at every call site) so the BEP-9-ness of
+/// this number reads locally.
+pub(crate) const UT_METADATA_PIECE_LEN: u32 = librqbit_core::constants::CHUNK_SIZE;
+
+/// Per-connection cap on the number of `ut_metadata` `request`s served to one
+/// peer (`carrier_peer::TunnelCarrierPeer::on_ut_metadata`) before we go
+/// silent — ignore further requests, no `reject`, no disconnect. Mirrors
+/// `MAX_SEEDER_PIECES_PER_CONN`'s reasoning exactly: metadata serving is a
+/// pre-auth amplification surface reachable by anyone who knows `server_pub`,
+/// and a disconnect (or even a `reject`) on hitting the cap would itself be a
+/// signal to a censor probing the rendezvous. The formula gives a small cap
+/// (typically `2 * 1 + 4 = 6`, since the synthetic carrier's info dict is
+/// under 16 KiB) comfortably above what a real client needs — one `request`
+/// per piece, once — while still bounding a flood of bogus/duplicate
+/// requests.
+pub(crate) fn max_metadata_requests_per_conn(metadata_size: usize) -> usize {
+    let pieces = metadata_size
+        .div_ceil(UT_METADATA_PIECE_LEN as usize)
+        .max(1);
+    2 * pieces + 4
+}
 
 // ── Carrier identity (masquerade torrent shape) ──────────────────────────────
 

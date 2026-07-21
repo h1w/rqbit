@@ -165,6 +165,25 @@ fn build_metainfo(
     (info, metainfo)
 }
 
+/// Extract the raw v2 info-dict bytes from a finalized carrier `metainfo`, by
+/// locating the exact bencode span used to compute its `info_hash`.
+///
+/// `torrent_v2_from_bytes` parses the `info` value via `WithRawBytes`, which
+/// captures the exact contiguous bencode span consumed while deserializing
+/// it, and computes `TorrentMetaV2::info_hash` as `info_hash_v2` of THAT SAME
+/// span (see `librqbit_core::torrent_metainfo_v2::torrent_v2_from_bytes`).
+/// Re-deriving the span the same way here — rather than re-encoding a fresh
+/// info dict from `TunnelCarrierConfig` — means
+/// `info_hash_v2(info_dict_bytes) == descriptor.info_hash` holds BY
+/// CONSTRUCTION, for both a freshly generated store (`initialize`) and one
+/// read back off disk (`reopen`), with no separate on-disk copy that could
+/// drift out of sync with the persisted metainfo.
+fn info_dict_bytes_from_metainfo(metainfo: &Bytes) -> anyhow::Result<Bytes> {
+    let parsed = torrent_v2_from_bytes(metainfo)
+        .with_context(|| "parsing metainfo to extract info dict span")?;
+    Ok(metainfo.slice_ref(parsed.info.raw_bytes.as_ref()))
+}
+
 fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     let tmp_path = path.with_extension("tmp");
     std::fs::write(&tmp_path, data)
@@ -180,6 +199,12 @@ pub(crate) struct TunnelCarrierStore {
     descriptor: TunnelCarrierDescriptor,
     root: PathBuf,
     have: BitBox<u8, Msb0>,
+    /// The raw v2 info-dict bytes (`info_hash_v2(info_dict_bytes) ==
+    /// descriptor.info_hash`, guaranteed by how it's derived — see
+    /// `info_dict_bytes_from_metainfo`). Served to peers as BEP-9
+    /// `ut_metadata` pieces (`carrier_peer.rs`); never re-encoded, so it can
+    /// never drift from the advertised info hash.
+    info_dict_bytes: Bytes,
 }
 
 impl TunnelCarrierStore {
@@ -234,6 +259,14 @@ impl TunnelCarrierStore {
         let metainfo_for_parse = metainfo.clone();
         let meta = torrent_v2_from_bytes(&metainfo_for_parse)
             .with_context(|| "re-validating carrier metainfo")?;
+
+        let info_dict_bytes = info_dict_bytes_from_metainfo(&metainfo_for_parse)
+            .with_context(|| "extracting info dict bytes from carrier metainfo on reopen")?;
+        debug_assert_eq!(
+            info_hash_v2(&info_dict_bytes),
+            meta.info_hash,
+            "info dict span must hash to the parsed info_hash"
+        );
 
         let descriptor = TunnelCarrierDescriptor {
             info_hash: meta.info_hash,
@@ -315,6 +348,7 @@ impl TunnelCarrierStore {
             descriptor,
             root: root.to_path_buf(),
             have,
+            info_dict_bytes,
         })
     }
 
@@ -361,6 +395,14 @@ impl TunnelCarrierStore {
             .with_context(|| "validating generated carrier metainfo")?;
         assert_eq!(parsed.info_hash, info_hash);
 
+        let info_dict_bytes = info_dict_bytes_from_metainfo(&metainfo)
+            .with_context(|| "extracting info dict bytes from generated carrier metainfo")?;
+        debug_assert_eq!(
+            info_hash_v2(&info_dict_bytes),
+            info_hash,
+            "info dict span must hash to the generated info_hash"
+        );
+
         let descriptor = TunnelCarrierDescriptor {
             info_hash,
             handshake_info_hash: parsed.handshake_info_hash(),
@@ -377,6 +419,7 @@ impl TunnelCarrierStore {
             descriptor,
             root: root.to_path_buf(),
             have,
+            info_dict_bytes,
         })
     }
 
@@ -386,6 +429,13 @@ impl TunnelCarrierStore {
 
     pub fn have_bitfield(&self) -> &BitSlice<u8, Msb0> {
         &self.have
+    }
+
+    /// The raw v2 info-dict bytes served to peers as BEP-9 `ut_metadata`
+    /// pieces. `info_hash_v2(info_dict_bytes()) == descriptor().info_hash`
+    /// always holds — see `info_dict_bytes_from_metainfo`.
+    pub fn info_dict_bytes(&self) -> &[u8] {
+        &self.info_dict_bytes
     }
 
     pub async fn read_piece(&self, piece: ValidPieceIndex, out: &mut [u8]) -> anyhow::Result<()> {
@@ -614,5 +664,52 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(s1.descriptor().info_hash, s2.descriptor().info_hash);
+    }
+
+    // ── info_dict_bytes (Plan C Task 1) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn info_dict_bytes_hashes_to_the_descriptor_info_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TunnelCarrierStore::open_or_initialize(dir.path(), &test_config())
+            .await
+            .unwrap();
+
+        assert!(
+            !store.info_dict_bytes().is_empty(),
+            "a real v2 info dict is never empty"
+        );
+        assert_eq!(
+            info_hash_v2(store.info_dict_bytes()),
+            store.descriptor().info_hash,
+            "served info-dict bytes must hash to the advertised info hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn info_dict_bytes_survives_reopen_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config();
+
+        let first = TunnelCarrierStore::open_or_initialize(dir.path(), &cfg)
+            .await
+            .unwrap();
+        let bytes_before = first.info_dict_bytes().to_vec();
+        let hash_before = first.descriptor().info_hash;
+        drop(first);
+
+        let reopened = TunnelCarrierStore::open_or_initialize(dir.path(), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.info_dict_bytes(),
+            bytes_before.as_slice(),
+            "reopen must derive the identical info dict span from disk"
+        );
+        assert_eq!(
+            info_hash_v2(reopened.info_dict_bytes()),
+            hash_before,
+            "reopened info-dict bytes must still hash to the original info hash"
+        );
     }
 }

@@ -28,8 +28,9 @@ use super::carrier_peer::{CoverMessage, TunnelCarrierPeer};
 use super::carrier_wire::CarrierReadHalf;
 use super::client::TunnelClient;
 use super::config::{
-    OPEN_WINDOW, OUTBOUND_QUEUE, PACING_DEFAULT_RATE, PER_CONN_QUEUE, PING_INTERVAL,
-    PING_NONCE_MAP_CAP,
+    COVER_REQUEST_BLOCK_LEN, COVER_REQUEST_BLOCKS_PER_PIECE, COVER_REQUEST_INTERVAL,
+    COVER_REQUEST_PIECE_SPAN, OPEN_WINDOW, OUTBOUND_QUEUE, PACING_DEFAULT_RATE, PER_CONN_QUEUE,
+    PING_INTERVAL, PING_NONCE_MAP_CAP,
 };
 use super::crypto::NoiseTransport;
 use super::flow::{
@@ -110,9 +111,10 @@ impl ClientMux {
         // Cover lane: the reader funnels inbound piece Request→Piece cover here
         // and the writer task drains it (unpaced, below control priority).
         let (cover_tx, cover_rx) = mpsc::channel::<CoverMessage>(OUTBOUND_QUEUE);
-        // Minimal piece cover so the carrier exhibits real BT Request/Piece
-        // traffic (Plan C elaborates the cadence). Cloned here, before
-        // `cover_tx` is moved into `reader_loop` below.
+        // Ongoing piece cover so the carrier exhibits CONTINUOUS BT
+        // Request/Piece traffic for the whole session (Plan C Task 3), not a
+        // one-shot startup burst. Cloned here, before `cover_tx` is moved into
+        // `reader_loop` below.
         let cover_seed = cover_tx.clone();
         // ONE pacing-rate cell shared by the writer (which re-reads it per
         // frame) and the control task below (which drives it to `target / rtt`).
@@ -170,6 +172,7 @@ impl ClientMux {
             sink.clone(),
             shutdown.clone(),
         ));
+        let cover_shutdown = shutdown.clone();
         tokio::spawn(ping_and_control_task(
             sink,
             ping_inflight,
@@ -180,21 +183,14 @@ impl ClientMux {
             shutdown,
         ));
 
-        // Minimal piece cover so the carrier exhibits real BT Request/Piece
-        // traffic (Plan C elaborates the cadence). Requests reference real
-        // pieces of the synthetic carrier torrent; the server answers with
-        // validated Piece messages.
-        tokio::spawn(async move {
-            for idx in 0u32..2 {
-                let _ = cover_seed
-                    .send(CoverMessage::Request {
-                        index: idx,
-                        begin: 0,
-                        length: 16384,
-                    })
-                    .await;
-            }
-        });
+        // Ongoing piece-cover cadence so the carrier exhibits CONTINUOUS BT
+        // Request/Piece exchange for the whole session — a real downloading peer
+        // keeps a steady request pipeline, so a carrier that fired a couple of
+        // requests at connect and then went BT-silent would have a tell. The
+        // requests reference real pieces of the synthetic carrier torrent; the
+        // (authenticated) server answers each with a validated Piece and, being
+        // authenticated, never self-chokes on the pre-auth pieces cap.
+        tokio::spawn(cover_request_cadence(cover_seed, cover_shutdown));
 
         mux
     }
@@ -404,6 +400,55 @@ async fn ping_and_control_task(
         // writer's pacing rate — the same shared `pacing_rate` cell the writer
         // re-reads per frame.
         drive_flow_control(&rtt, &controller, &paced, &pacing_rate);
+    }
+}
+
+/// Ongoing cover-request cadence for an active carrier (Plan C Task 3).
+///
+/// A real leeching BitTorrent peer keeps a steady pipeline of block `Request`s
+/// in flight for the whole session. This task makes the masquerade carrier do
+/// the same: every `COVER_REQUEST_INTERVAL` it enqueues one small block
+/// `Request` for a rotating in-range piece/block, so a passive observer sees
+/// CONTINUOUS `Request`/`Piece` exchange rather than a single startup burst
+/// (the previous one-shot 2-request seed) followed by BT silence.
+///
+/// Cheap and strictly best-effort: it `try_send`s on the shared cover lane and
+/// DROPS on a full lane (it's cover — never worth blocking real tunnel data or
+/// the reader behind it). The rotating index stays below
+/// `COVER_REQUEST_PIECE_SPAN`, which every synthetic carrier is guaranteed to
+/// have, so a request is always in range without the client needing to know the
+/// exact corpus size. Stops on shutdown, or once the cover lane is gone.
+async fn cover_request_cadence(cover_tx: mpsc::Sender<CoverMessage>, shutdown: CancellationToken) {
+    // A real client that sees a peer advertise `ut_metadata` + `metadata_size`
+    // and lacks the metadata fetches it ONCE, up front (BEP-9). Best-effort;
+    // the server answers with a `ut_metadata` data response.
+    let _ = cover_tx.try_send(CoverMessage::UtMetadataRequest(0));
+
+    let mut interval = tokio::time::interval(COVER_REQUEST_INTERVAL);
+    // A rotating counter over (piece, block): the piece index walks
+    // `0..COVER_REQUEST_PIECE_SPAN` and, once it wraps, the block offset walks
+    // `0..COVER_REQUEST_BLOCKS_PER_PIECE` — so successive requests look like a
+    // client fetching different blocks of different pieces.
+    let mut counter: u32 = 0;
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        let index = counter % COVER_REQUEST_PIECE_SPAN;
+        let block = (counter / COVER_REQUEST_PIECE_SPAN) % COVER_REQUEST_BLOCKS_PER_PIECE;
+        let begin = block * COVER_REQUEST_BLOCK_LEN;
+        // Best-effort: drop on a full cover lane (`try_send`). If the lane is
+        // gone (writer exited / peer disconnected) there's nothing left to do.
+        match cover_tx.try_send(CoverMessage::Request {
+            index,
+            begin,
+            length: COVER_REQUEST_BLOCK_LEN,
+        }) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => break,
+        }
+        counter = counter.wrapping_add(1);
     }
 }
 

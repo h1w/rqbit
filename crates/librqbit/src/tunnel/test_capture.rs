@@ -42,6 +42,11 @@ pub(crate) enum CarrierEvent {
     Have,
     Cancel,
     KeepAlive,
+    /// A BEP-9 `ut_metadata` `request` (a peer asking us for a metadata piece).
+    UtMetadataRequest,
+    /// A BEP-9 `ut_metadata` `data` response (a served metadata piece).
+    UtMetadataData,
+    /// Any other extended (BEP-10) message that is not one of the above.
     Extended,
 }
 
@@ -62,8 +67,15 @@ impl CarrierEvent {
             Message::Piece(_) => CarrierEvent::Piece,
             Message::Extended(ext_msg) => {
                 use peer_binary_protocol::extended::ExtendedMessage;
+                use peer_binary_protocol::extended::ut_metadata::UtMetadata;
                 match ext_msg {
                     ExtendedMessage::Handshake(_) => CarrierEvent::ExtendedHandshake,
+                    ExtendedMessage::UtMetadata(UtMetadata::Request(_)) => {
+                        CarrierEvent::UtMetadataRequest
+                    }
+                    ExtendedMessage::UtMetadata(UtMetadata::Data(_)) => {
+                        CarrierEvent::UtMetadataData
+                    }
                     _ => CarrierEvent::Extended,
                 }
             }
@@ -124,15 +136,50 @@ impl RawCapture {
 #[derive(Debug)]
 pub(crate) struct CarrierTrace {
     events: Vec<CarrierEvent>,
+    /// Whether ANY extended handshake observed on this thread advertised the
+    /// `ut_metadata` (BEP-9) extension. The trace normally keeps only event
+    /// kinds, not payloads; this one payload fact is retained so a cadence gate
+    /// can assert the handshake actually advertised `ut_metadata` (not merely
+    /// that some extended handshake occurred).
+    handshake_advertised_ut_metadata: bool,
+    /// The largest `metadata_size` advertised on any observed extended
+    /// handshake (0 if none advertised one). A real client that advertises
+    /// `ut_metadata` always pairs it with a non-zero `metadata_size`.
+    handshake_metadata_size: u32,
 }
 
 impl CarrierTrace {
     pub(crate) fn new() -> Self {
-        Self { events: Vec::new() }
+        Self {
+            events: Vec::new(),
+            handshake_advertised_ut_metadata: false,
+            handshake_metadata_size: 0,
+        }
     }
 
     pub(crate) fn push(&mut self, event: CarrierEvent) {
         self.events.push(event);
+    }
+
+    /// Record the `ut_metadata` advertisement seen on an extended handshake
+    /// (BEP-9). Called by the message tap for every observed
+    /// `ExtendedMessage::Handshake`.
+    pub(crate) fn record_handshake_advertisement(&mut self, ut_metadata: bool, metadata_size: u32) {
+        self.handshake_advertised_ut_metadata |= ut_metadata;
+        self.handshake_metadata_size = self.handshake_metadata_size.max(metadata_size);
+    }
+
+    /// Whether any observed extended handshake advertised `ut_metadata`.
+    #[allow(dead_code)]
+    pub(crate) fn advertised_ut_metadata(&self) -> bool {
+        self.handshake_advertised_ut_metadata
+    }
+
+    /// The largest `metadata_size` advertised on any observed extended
+    /// handshake.
+    #[allow(dead_code)]
+    pub(crate) fn advertised_metadata_size(&self) -> u32 {
+        self.handshake_metadata_size
     }
 
     /// Assert that `wanted` events appear in order (not necessarily

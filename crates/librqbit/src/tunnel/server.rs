@@ -430,6 +430,11 @@ impl TunnelServer {
                 // pre-auth cap (`MAX_SEEDER_PIECES_PER_CONN`) never carries into
                 // the authenticated relay and self-chokes cover mid-session.
                 carrier_peer.reset_pieces_served();
+                // Mark the connection authenticated so `on_request` skips the
+                // pre-auth pieces self-choke entirely (Plan C Task 3): the
+                // ongoing post-auth piece-cover cadence must run for the whole
+                // session without ever hitting the cap.
+                carrier_peer.set_authenticated(true);
                 self.peers.write().await.insert(client_key.clone(), true);
                 Ok(AcceptOutcome::Admitted(Box::new(AdmittedPeer {
                     client_key,
@@ -1216,11 +1221,18 @@ mod tests {
             .expect("accept task join")
             .expect("accept must not error");
         match outcome {
-            AcceptOutcome::Admitted(peer) => assert_eq!(
-                peer.carrier_peer.pieces_served(),
-                0,
-                "a promoted peer must have its pre-auth pieces-served counter reset to 0"
-            ),
+            AcceptOutcome::Admitted(peer) => {
+                assert_eq!(
+                    peer.carrier_peer.pieces_served(),
+                    0,
+                    "a promoted peer must have its pre-auth pieces-served counter reset to 0"
+                );
+                assert!(
+                    peer.carrier_peer.is_authenticated(),
+                    "a promoted peer must be marked authenticated so on_request skips the \
+                     pre-auth pieces self-choke"
+                );
+            }
             AcceptOutcome::Seeded => panic!("a valid allowlisted client must be Admitted"),
         }
     }
