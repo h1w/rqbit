@@ -4,6 +4,8 @@ use bitvec::{boxed::BitBox, order::Msb0};
 use buffers::ByteBuf;
 use bytes::Bytes;
 use librqbit_core::{Id32, torrent_metainfo_v2::torrent_v2_from_bytes};
+use peer_binary_protocol::extended::ExtendedMessage;
+use peer_binary_protocol::extended::ut_metadata::{UtMetadata, UtMetadataData};
 use peer_binary_protocol::{Message, Piece, Request};
 use sha2::{Digest, Sha256};
 
@@ -62,6 +64,18 @@ pub(crate) enum CoverMessage {
         data: bytes::Bytes,
     },
     KeepAlive,
+    /// A BEP-9 `ut_metadata` `data` response: one <=16 KiB piece of the
+    /// carrier's raw info-dict bytes, plus the total metadata size (both
+    /// required fields of the `data` message per BEP-9).
+    UtMetadataData {
+        piece: u32,
+        total_size: u32,
+        data: bytes::Bytes,
+    },
+    /// A BEP-9 `ut_metadata` `reject`: sent for an out-of-range piece index
+    /// instead of a hard error/disconnect — a real client rejects rather than
+    /// drops the connection over a bad metadata request.
+    UtMetadataReject(u32),
 }
 
 impl CoverMessage {
@@ -85,6 +99,16 @@ impl CoverMessage {
                 Message::Piece(Piece::from_data(*index, *begin, data))
             }
             CoverMessage::KeepAlive => Message::KeepAlive,
+            CoverMessage::UtMetadataData {
+                piece,
+                total_size,
+                data,
+            } => Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Data(
+                UtMetadataData::from_bytes(*piece, *total_size, ByteBuf(data.as_ref())),
+            ))),
+            CoverMessage::UtMetadataReject(piece) => {
+                Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Reject(*piece)))
+            }
         }
     }
 }
@@ -193,16 +217,31 @@ pub(crate) struct TunnelCarrierPeer {
     /// Capped at `MAX_SEEDER_PIECES_PER_CONN` — see `local_choked`.
     pieces_served: usize,
     layer: CarrierPieceLayer,
+    /// Count of `ut_metadata` `request`s served this connection. Capped at
+    /// `metadata_requests_cap` (unlike `pieces_served`, NOT gated by
+    /// `local_choked` — BEP-9 metadata exchange is choke-independent in real
+    /// clients, and it never resets on promotion: a real client fetches
+    /// metadata once, not continuously, so there's no ongoing post-auth cover
+    /// use for it the way there is for `Piece`).
+    metadata_requests_served: usize,
+    /// Per-connection cap on `metadata_requests_served`, computed once at
+    /// construction from this carrier's actual info-dict size — see
+    /// `config::max_metadata_requests_per_conn`.
+    metadata_requests_cap: usize,
 }
 
 impl TunnelCarrierPeer {
     pub fn new(carrier: Arc<TunnelCarrierStore>) -> Result<Self, TunnelCarrierError> {
         let layer = CarrierPieceLayer::from_descriptor(&carrier.descriptor().metainfo)?;
+        let metadata_requests_cap =
+            super::config::max_metadata_requests_per_conn(carrier.info_dict_bytes().len());
         Ok(Self {
             remote_have: bitvec::bitbox![u8, Msb0; 0; layer.npieces()],
             local_choked: true,
             remote_choked: true,
             pieces_served: 0,
+            metadata_requests_served: 0,
+            metadata_requests_cap,
             carrier,
             layer,
         })
@@ -282,6 +321,7 @@ impl TunnelCarrierPeer {
             Message::Unchoke => Ok(self.on_unchoke()),
             Message::Interested | Message::NotInterested => Ok(vec![]),
             Message::KeepAlive => Ok(vec![]),
+            Message::Extended(ExtendedMessage::UtMetadata(m)) => Ok(self.on_ut_metadata(m)),
             Message::Extended(_) => Ok(vec![]),
             Message::Cancel(_) => Ok(vec![]),
         }
@@ -367,6 +407,55 @@ impl TunnelCarrierPeer {
         }
 
         Ok(actions)
+    }
+
+    /// Serve (or bound/reject) an inbound BEP-9 `ut_metadata` message.
+    ///
+    /// Infallible by design: an out-of-range piece gets a `reject` (BEP-9's
+    /// own "I can't serve this" response — what a real client sends, not a
+    /// dropped connection), and exceeding the per-connection cap goes
+    /// silent — no reject, no disconnect. Either a hard error or a disconnect
+    /// here would itself be a distinguishing tell for a censor probing the
+    /// rendezvous with a bogus/duplicated metadata request.
+    fn on_ut_metadata(&mut self, msg: UtMetadata<ByteBuf<'_>>) -> Vec<CarrierAction> {
+        let piece = match msg {
+            UtMetadata::Request(piece) => piece,
+            // We never issue our own ut_metadata requests on this cover path,
+            // so an unsolicited Data/Reject has no state to update — same
+            // no-op treatment as any other unexpected extended message.
+            UtMetadata::Data(_) | UtMetadata::Reject(_) => return vec![],
+        };
+
+        // Per-connection cap on the pre-auth metadata amplification surface
+        // (reachable by anyone who knows `server_pub`, same reasoning as
+        // `MAX_SEEDER_PIECES_PER_CONN` above): once reached, go silent.
+        if self.metadata_requests_served >= self.metadata_requests_cap {
+            return vec![];
+        }
+        self.metadata_requests_served += 1;
+
+        let info_dict = self.carrier.info_dict_bytes();
+        let total_size = info_dict.len() as u32;
+        let piece_len = super::config::UT_METADATA_PIECE_LEN;
+        let npieces = total_size.div_ceil(piece_len).max(1);
+
+        if piece >= npieces {
+            return vec![CarrierAction::OutgoingMessage(
+                CoverMessage::UtMetadataReject(piece),
+            )];
+        }
+
+        let start = (piece as usize) * (piece_len as usize);
+        let end = (start + piece_len as usize).min(info_dict.len());
+        let data = bytes::Bytes::copy_from_slice(&info_dict[start..end]);
+
+        vec![CarrierAction::OutgoingMessage(
+            CoverMessage::UtMetadataData {
+                piece,
+                total_size,
+                data,
+            },
+        )]
     }
 
     async fn on_piece(
@@ -975,6 +1064,175 @@ mod tests {
         assert!(
             saw_choke,
             "the request that reaches the pieces cap must emit an explicit Choke"
+        );
+    }
+
+    // ── ut_metadata serving (Plan C Task 1) ────────────────────────────────
+
+    #[tokio::test]
+    async fn serves_metadata_request_matching_info_dict_bytes() {
+        let (store, _dir) = test_store().await;
+        let info_dict = store.info_dict_bytes().to_vec();
+        let mut peer = TunnelCarrierPeer::new(store).unwrap();
+
+        let actions = peer
+            .on_message(Message::Extended(ExtendedMessage::UtMetadata(
+                UtMetadata::Request(0),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(actions.len(), 1, "expected one UtMetadataData action");
+        match &actions[0] {
+            CarrierAction::OutgoingMessage(CoverMessage::UtMetadataData {
+                piece,
+                total_size,
+                data,
+            }) => {
+                assert_eq!(*piece, 0);
+                assert_eq!(*total_size, info_dict.len() as u32);
+                assert_eq!(data.as_ref(), info_dict.as_slice());
+            }
+            other => panic!("expected UtMetadataData, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reassembled_metadata_pieces_hash_to_the_advertised_info_hash() {
+        use librqbit_core::constants::CHUNK_SIZE;
+        use librqbit_core::torrent_metainfo_v2::info_hash_v2;
+
+        // Force a multi-piece info dict (BEP-9 chunks at 16 KiB) via an
+        // oversized display name — the synthetic carrier's info dict
+        // normally fits in one piece, but the reassembly path must be
+        // exercised across more than one piece too.
+        let mut cfg = test_config();
+        cfg.display_name = "x".repeat(20_000);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            TunnelCarrierStore::open_or_initialize(dir.path(), &cfg)
+                .await
+                .unwrap(),
+        );
+        let expected = store.info_dict_bytes().to_vec();
+        let expected_hash = store.descriptor().info_hash;
+        assert!(
+            expected.len() > CHUNK_SIZE as usize,
+            "test setup: info dict must span >1 metadata piece, got {} bytes",
+            expected.len()
+        );
+
+        let mut peer = TunnelCarrierPeer::new(store).unwrap();
+        let npieces = (expected.len() as u32).div_ceil(CHUNK_SIZE);
+        assert!(npieces > 1, "test setup: expected >1 metadata piece");
+
+        let mut reassembled = Vec::new();
+        for piece in 0..npieces {
+            let actions = peer
+                .on_message(Message::Extended(ExtendedMessage::UtMetadata(
+                    UtMetadata::Request(piece),
+                )))
+                .await
+                .unwrap();
+            match &actions[..] {
+                [
+                    CarrierAction::OutgoingMessage(CoverMessage::UtMetadataData {
+                        piece: p,
+                        data,
+                        ..
+                    }),
+                ] => {
+                    assert_eq!(*p, piece);
+                    reassembled.extend_from_slice(data);
+                }
+                other => {
+                    panic!("expected one UtMetadataData action for piece {piece}, got {other:?}")
+                }
+            }
+        }
+
+        assert_eq!(
+            reassembled, expected,
+            "reassembled bytes must equal info_dict_bytes"
+        );
+        assert_eq!(
+            info_hash_v2(&reassembled),
+            expected_hash,
+            "reassembled bytes must hash to the advertised info hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_out_of_range_metadata_piece_without_panicking() {
+        let (mut peer, _dir) = test_peer().await;
+
+        let actions = peer
+            .on_message(Message::Extended(ExtendedMessage::UtMetadata(
+                UtMetadata::Request(9_999),
+            )))
+            .await
+            .unwrap();
+
+        assert_eq!(actions.len(), 1, "expected one Reject action");
+        assert!(
+            matches!(
+                &actions[0],
+                CarrierAction::OutgoingMessage(CoverMessage::UtMetadataReject(9_999))
+            ),
+            "expected UtMetadataReject(9999), got {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_requests_cap_goes_silent_without_disconnect() {
+        let (store, _dir) = test_store().await;
+        let cap =
+            super::super::config::max_metadata_requests_per_conn(store.info_dict_bytes().len());
+        let mut peer = TunnelCarrierPeer::new(store).unwrap();
+        peer.set_local_choked(false);
+
+        for n in 0..cap {
+            let actions = peer
+                .on_message(Message::Extended(ExtendedMessage::UtMetadata(
+                    UtMetadata::Request(0),
+                )))
+                .await
+                .unwrap();
+            assert!(
+                actions.iter().any(|a| matches!(
+                    a,
+                    CarrierAction::OutgoingMessage(CoverMessage::UtMetadataData { .. })
+                )),
+                "request {n} (within cap) must be served"
+            );
+        }
+
+        // Beyond the cap: silence — no Data, no Reject, no Disconnect, no Err.
+        // This is the actual "no tell" property: a censor probing the
+        // rendezvous past the cap can't distinguish "ignored" from "gone".
+        let actions = peer
+            .on_message(Message::Extended(ExtendedMessage::UtMetadata(
+                UtMetadata::Request(0),
+            )))
+            .await
+            .unwrap();
+        assert!(
+            actions.is_empty(),
+            "request beyond the metadata cap must be silently ignored, got {actions:?}"
+        );
+
+        // The connection keeps functioning normally for ordinary cover —
+        // going silent on metadata must not affect anything else.
+        let piece_actions = peer
+            .on_message(Message::Request(Request::new(0, 0, TEST_PIECE_LEN)))
+            .await
+            .unwrap();
+        assert!(
+            piece_actions.iter().any(|a| matches!(
+                a,
+                CarrierAction::OutgoingMessage(CoverMessage::Piece { .. })
+            )),
+            "carrier must keep serving ordinary Piece cover after the metadata cap"
         );
     }
 }

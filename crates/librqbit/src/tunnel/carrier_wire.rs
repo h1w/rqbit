@@ -219,8 +219,16 @@ impl CarrierWire {
             }
 
             // ── BEP10 extended handshake ────────────────────────────────────
+            // `ExtendedHandshake::new()` already advertises `m` = { ut_metadata:
+            // 3, ut_pex: 1, rq_tunnel: 4 } (`PeerExtendedMessageIds::my()`) —
+            // shared with the main (non-tunnel) client's real BEP-10 support, so
+            // there's nothing extra to add to `m` here. A real client that
+            // advertises `ut_metadata` always pairs it with a non-zero
+            // `metadata_size`; omitting it here would itself be the tell a
+            // metadata-probing peer looks for.
             let mut ext = ExtendedHandshake::new();
             ext.v = Some(buffers::ByteBuf(CLIENT_VERSION));
+            ext.metadata_size = Some(carrier.info_dict_bytes().len() as u32);
             write_message(
                 &mut writer,
                 &mut scratch,
@@ -554,5 +562,93 @@ mod tests {
         };
         assert_eq!(echoed, payload);
         assert_eq!(server.await.unwrap(), payload);
+    }
+
+    // ── ut_metadata advertising (Plan C Task 1) ─────────────────────────────
+
+    /// A real peer never sees our own `establish()`'s parsed extended
+    /// handshake — it only ever sees the RAW BYTES on the wire. So rather than
+    /// asserting on some internal value, this test plays the "peer" role
+    /// itself over a plain (unencrypted — `establish` is agnostic to the
+    /// transport underneath) duplex: send our own BT handshake, then read back
+    /// the server's BT handshake and its extended handshake exactly as a real
+    /// probing client would, and inspect what it actually advertises.
+    #[tokio::test]
+    async fn extended_handshake_advertises_ut_metadata_and_size() {
+        use crate::vectored_traits::AsyncReadVectoredIntoCompat;
+
+        let carrier = test_carrier().await;
+        let info_hash = carrier.descriptor().handshake_info_hash;
+        let expected_metadata_size = carrier.info_dict_bytes().len() as u32;
+        assert!(
+            expected_metadata_size > 0,
+            "sanity: the carrier torrent must have a non-empty info dict"
+        );
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let server_carrier = carrier.clone();
+        let server = tokio::spawn(async move {
+            let (r, w) = tokio::io::split(server_io);
+            let reader: BoxAsyncReadVectored = Box::new(r.into_vectored_compat());
+            let writer: BoxAsyncWrite = Box::new(w);
+            CarrierWire::establish(reader, writer, server_carrier, info_hash).await
+        });
+
+        let (client_r, mut client_w) = tokio::io::split(client_io);
+        let mut client_reader: BoxAsyncReadVectored = Box::new(client_r.into_vectored_compat());
+
+        // Send our (peer-side) BT handshake, exactly as a real peer would —
+        // `HANDSHAKE_RESERVED` so the server sees us as extended-capable.
+        let mut scratch = vec![0u8; MAX_MSG_LEN];
+        let ours = Handshake {
+            reserved: HANDSHAKE_RESERVED,
+            info_hash,
+            peer_id: Id20::new([7u8; 20]),
+        };
+        let n = ours.serialize_unchecked_len(&mut scratch);
+        client_w.write_all(&scratch[..n]).await.unwrap();
+        client_w.flush().await.unwrap();
+
+        // Read the server's BT handshake, then its extended handshake — what a
+        // real peer parses before deciding what extensions it supports.
+        let mut read_buf = ReadBuf::new();
+        let their_handshake = read_buf
+            .read_handshake(&mut client_reader, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(their_handshake.info_hash, info_hash);
+
+        let msg = read_buf
+            .read_message(&mut client_reader, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let handshake = match msg {
+            Message::Extended(ExtendedMessage::Handshake(h)) => h,
+            other => panic!("expected an extended handshake first, got {other:?}"),
+        };
+
+        assert_eq!(
+            handshake.m.ut_metadata,
+            Some(peer_binary_protocol::MY_EXTENDED_UT_METADATA),
+            "must advertise the ut_metadata extension id"
+        );
+        assert_eq!(
+            handshake.metadata_size,
+            Some(expected_metadata_size),
+            "must advertise the exact info-dict length as metadata_size"
+        );
+
+        // Reply with our own extended handshake (advertising rq_tunnel, like
+        // the real client does) so the server's `establish` completes
+        // normally instead of timing out.
+        let reply = Message::Extended(ExtendedMessage::Handshake(ExtendedHandshake::new()));
+        let n = reply
+            .serialize(&mut scratch, &|| PeerExtendedMessageIds::default())
+            .unwrap();
+        client_w.write_all(&scratch[..n]).await.unwrap();
+        client_w.flush().await.unwrap();
+
+        server.await.unwrap().unwrap();
     }
 }

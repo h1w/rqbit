@@ -264,6 +264,34 @@ pub(crate) const NOISE_INIT_MAX: usize = 160;
 /// ops per connection.
 pub(crate) const MAX_NOISE_ATTEMPTS: usize = 8;
 
+// ── Metadata (ut_metadata / BEP-9) serving ──────────────────────────────────
+
+/// BEP-9 chunks the info dict into pieces of this size (16 KiB) — the same
+/// value as `librqbit_core::constants::CHUNK_SIZE`, which
+/// `UtMetadataData::validate` enforces on the wire for the LAST piece's exact
+/// remainder size too. Kept as its own named constant here (rather than
+/// importing the shared one directly at every call site) so the BEP-9-ness of
+/// this number reads locally.
+pub(crate) const UT_METADATA_PIECE_LEN: u32 = librqbit_core::constants::CHUNK_SIZE;
+
+/// Per-connection cap on the number of `ut_metadata` `request`s served to one
+/// peer (`carrier_peer::TunnelCarrierPeer::on_ut_metadata`) before we go
+/// silent — ignore further requests, no `reject`, no disconnect. Mirrors
+/// `MAX_SEEDER_PIECES_PER_CONN`'s reasoning exactly: metadata serving is a
+/// pre-auth amplification surface reachable by anyone who knows `server_pub`,
+/// and a disconnect (or even a `reject`) on hitting the cap would itself be a
+/// signal to a censor probing the rendezvous. The formula gives a small cap
+/// (typically `2 * 1 + 4 = 6`, since the synthetic carrier's info dict is
+/// under 16 KiB) comfortably above what a real client needs — one `request`
+/// per piece, once — while still bounding a flood of bogus/duplicate
+/// requests.
+pub(crate) fn max_metadata_requests_per_conn(metadata_size: usize) -> usize {
+    let pieces = metadata_size
+        .div_ceil(UT_METADATA_PIECE_LEN as usize)
+        .max(1);
+    2 * pieces + 4
+}
+
 // ── Carrier identity (masquerade torrent shape) ──────────────────────────────
 
 /// Piece length for the synthetic carrier torrent. 256 KiB is a common real
