@@ -195,6 +195,44 @@ pub(crate) const MAX_CARRIERS: usize = 16;
 /// a deliberately short leash.
 pub(crate) const SEEDER_IDLE: Duration = Duration::from_secs(120);
 
+/// Overall wall-clock deadline for the ENTIRE pre-auth seed loop
+/// (`server.rs::seed_until_promoted`), mirroring
+/// `carrier_wire::ESTABLISH_DEADLINE`'s reasoning exactly: `SEEDER_IDLE`
+/// resets on every message, so alone it can't bound a peer that streams
+/// `Request`s (each driving a 256 KiB disk read + `Piece` write) just fast
+/// enough to never go idle. This bounds the WHOLE seed window regardless of
+/// activity. On elapse the connection is treated exactly like an ordinary
+/// idle disconnect (`AcceptOutcome::Seeded`), never an error — a censor
+/// probing the rendezvous learns nothing from it.
+pub(crate) const SEED_WINDOW_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Per-connection cap on the number of `Piece`s served to one
+/// not-yet-authenticated peer (`carrier_peer::TunnelCarrierPeer::on_request`)
+/// before it is self-choked (no further `Request`s served, an explicit
+/// `Choke` sent). A real overloaded seeder does exactly this. A legitimate
+/// client authenticates almost immediately (it sends its Noise handshake
+/// right after the carrier handshake completes, without streaming cover
+/// `Request`s first) and never comes close to this cap.
+pub(crate) const MAX_SEEDER_PIECES_PER_CONN: usize = 64;
+
+/// Maximum number of peers the seeder keeps concurrently UNCHOKED (i.e.
+/// actually willing to serve `Piece`s to), tracked server-wide via a
+/// semaphore (see `server.rs`'s upload-slot admission in `accept`). A real
+/// seeder optimistically unchokes but only actually reciprocates to a
+/// handful of peers at a time; this bounds aggregate pre-auth disk/CPU load
+/// across ALL connections, not just one (that's `MAX_SEEDER_PIECES_PER_CONN`).
+pub(crate) const SEEDER_UPLOAD_SLOTS: usize = 4;
+
+/// Per-source-IP cap on concurrent pre-auth seeder connections (checked in
+/// `server.rs::run`'s accept loop, before the MSE/BT handshake even starts).
+/// Bounds one address from opening unbounded parallel connections to
+/// multiply its resource draw.
+pub(crate) const MAX_SEEDER_CONNS_PER_IP: usize = 8;
+
+/// Global cap on concurrent pre-auth seeder connections, across all source
+/// IPs (checked alongside `MAX_SEEDER_CONNS_PER_IP` in `server.rs::run`).
+pub(crate) const MAX_SEEDER_CONNS_TOTAL: usize = 256;
+
 // ── Carrier identity (masquerade torrent shape) ──────────────────────────────
 
 /// Piece length for the synthetic carrier torrent. 256 KiB is a common real

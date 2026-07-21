@@ -4,13 +4,15 @@
 /// responder handshake with carrier pairing, completes Noise IK, validates client
 /// keys against the allowlist, and admits authenticated peers.
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use librqbit_core::Id20;
 use peer_binary_protocol::{Message, extended::ExtendedMessage};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use super::carrier::TunnelCarrierStore;
 use super::crypto::{self, NoiseTransport, TunnelCryptoError};
@@ -87,13 +89,23 @@ pub(crate) enum AcceptOutcome {
 /// Returns:
 ///   - `Ok(Some((transport, client_key)))` — a valid allowlisted Noise
 ///     handshake landed; promote to a tunnel relay.
-///   - `Ok(None)` — the peer never authenticated (idle timeout, clean
-///     disconnect/read error, or an oversized/malformed `rq_tunnel` frame);
-///     treat exactly like a normal BT peer that came and went.
+///   - `Ok(None)` — the peer never authenticated (idle timeout, overall
+///     deadline elapsed, clean disconnect/read error, or an
+///     oversized/malformed `rq_tunnel` frame); treat exactly like a normal BT
+///     peer that came and went.
 ///   - `Err(_)` — a real I/O error writing the Noise reply to an otherwise
 ///     freshly-authenticated peer. This is the one case genuinely worth
 ///     surfacing as an admission error (it happens strictly AFTER the peer
 ///     already proved a valid key, so it reveals nothing to a prober).
+///
+/// `idle` resets on every message (an inactivity timeout); `deadline` does
+/// NOT — it bounds the WHOLE seed window regardless of activity, mirroring
+/// `carrier_wire::ESTABLISH_DEADLINE`'s reasoning exactly: a peer that streams
+/// `Request`s (each driving a 256 KiB disk read + `Piece` write) just fast
+/// enough to never go idle could otherwise stay in the pre-auth seed loop
+/// indefinitely, driving unbounded disk/CPU/bandwidth use. On `deadline`
+/// elapsing this returns `Ok(None)` — an ordinary idle disconnect, not an
+/// error, so a censor probing the rendezvous learns nothing from it.
 async fn seed_until_promoted(
     read_half: &mut super::carrier_wire::CarrierReadHalf,
     write_half: &mut super::carrier_wire::CarrierWriteHalf,
@@ -101,67 +113,156 @@ async fn seed_until_promoted(
     identity_key: &TunnelPrivateKey,
     allowed: &HashSet<TunnelPublicKey>,
     idle: Duration,
+    deadline: Duration,
 ) -> Result<Option<(NoiseTransport, TunnelPublicKey)>, TunnelAdmissionError> {
-    let mut defrag = super::carrier_chunk::CarrierDefragmenter::new(
-        super::carrier_chunk::MAX_CARRIER_CIPHERTEXT,
-    );
+    let seed = async {
+        let mut defrag = super::carrier_chunk::CarrierDefragmenter::new(
+            super::carrier_chunk::MAX_CARRIER_CIPHERTEXT,
+        );
 
-    loop {
-        let msg = match tokio::time::timeout(idle, read_half.recv_message()).await {
-            Err(_elapsed) => return Ok(None), // idle disconnect: normal BT churn, no tell
-            Ok(Ok(Some(m))) => m,
-            Ok(_) => return Ok(None), // peer closed / read error
-        };
+        loop {
+            let msg = match tokio::time::timeout(idle, read_half.recv_message()).await {
+                Err(_elapsed) => return Ok(None), // idle disconnect: normal BT churn, no tell
+                Ok(Ok(Some(m))) => m,
+                Ok(_) => return Ok(None), // peer closed / read error
+            };
 
-        match msg {
-            Message::Extended(ExtendedMessage::RqTunnel(rq)) => {
-                let blobs = match defrag.push(rq.as_bytes()) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(None), // oversized: drop like a misbehaving peer
-                };
-                for ciphertext in blobs {
-                    if ciphertext.len() > 512 {
-                        // Not a plausible Noise IK initiator message; ignore
-                        // and keep seeding rather than tell a prober anything.
-                        continue;
-                    }
-                    match crypto::responder_accept(identity_key, &ciphertext, allowed) {
-                        Ok((transport, key, reply)) => {
-                            for chunk in super::carrier_chunk::chunk_ciphertext(&reply) {
-                                write_half.send_tunnel(&chunk).await.map_err(|e| {
-                                    TunnelAdmissionError::CarrierHandshakeFailed(anyhow::anyhow!(
-                                        "{e}"
-                                    ))
-                                })?;
-                            }
-                            return Ok(Some((transport, key))); // PROMOTE
+            match msg {
+                Message::Extended(ExtendedMessage::RqTunnel(rq)) => {
+                    let blobs = match defrag.push(rq.as_bytes()) {
+                        Ok(b) => b,
+                        Err(_) => return Ok(None), // oversized: drop like a misbehaving peer
+                    };
+                    for ciphertext in blobs {
+                        if ciphertext.len() > 512 {
+                            // Not a plausible Noise IK initiator message; ignore
+                            // and keep seeding rather than tell a prober anything.
+                            continue;
                         }
-                        Err(_) => {
-                            // Bad Noise / non-allowlisted key: no reply, no
-                            // drop — keep seeding, no tell.
+                        match crypto::responder_accept(identity_key, &ciphertext, allowed) {
+                            Ok((transport, key, reply)) => {
+                                for chunk in super::carrier_chunk::chunk_ciphertext(&reply) {
+                                    write_half.send_tunnel(&chunk).await.map_err(|e| {
+                                        TunnelAdmissionError::CarrierHandshakeFailed(
+                                            anyhow::anyhow!("{e}"),
+                                        )
+                                    })?;
+                                }
+                                return Ok(Some((transport, key))); // PROMOTE
+                            }
+                            Err(_) => {
+                                // Bad Noise / non-allowlisted key: no reply, no
+                                // drop — keep seeding, no tell.
+                            }
                         }
                     }
                 }
-            }
-            other => {
-                // Serve cover exactly like the pre-establish early-cover path.
-                match carrier_peer.on_message(other).await {
-                    Ok(actions) => {
-                        for action in actions {
-                            if let super::carrier_peer::CarrierAction::OutgoingMessage(m) = action {
-                                // Best-effort: a serialize failure just drops
-                                // one cover message, never the connection.
-                                let _ = write_half.send_message(&m.to_message()).await;
+                other => {
+                    // Serve cover exactly like the pre-establish early-cover path.
+                    match carrier_peer.on_message(other).await {
+                        Ok(actions) => {
+                            for action in actions {
+                                if let super::carrier_peer::CarrierAction::OutgoingMessage(m) =
+                                    action
+                                {
+                                    // Best-effort: a serialize failure just drops
+                                    // one cover message, never the connection.
+                                    let _ = write_half.send_message(&m.to_message()).await;
+                                }
                             }
                         }
-                    }
-                    Err(_) => {
-                        // Invalid cover request from the peer: ignore, keep seeding.
+                        Err(_) => {
+                            // Invalid cover request from the peer: ignore, keep seeding.
+                        }
                     }
                 }
             }
         }
+    };
+
+    match tokio::time::timeout(deadline, seed).await {
+        Ok(result) => result,
+        Err(_elapsed) => Ok(None), // overall seed-window elapsed: normal idle disconnect, no tell
     }
+}
+
+// ── Pre-auth connection admission caps (Plan B, Task 2) ─────────────────────
+//
+// A real seeder also bounds how many peers it will even keep a TCP connection
+// open for concurrently — distinct from `SEEDER_UPLOAD_SLOTS` (how many of
+// those admitted connections it actually SERVES `Piece`s to, see `accept`).
+// Checked in `run`'s accept loop, before the MSE/BT handshake even starts, so
+// an over-cap connection costs nothing beyond the `TcpListener::accept()`
+// itself.
+
+/// RAII guard for one admitted pre-auth seeder connection. Decrements the
+/// per-IP and global in-flight counts on drop — covering every exit path
+/// (promoted, seeded-out/timed-out, admission error, or the spawned task
+/// simply ending) with the SAME code path, so a missed decrement can never
+/// permanently wedge a cap closed.
+struct SeederConnGuard {
+    counts: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+    total: Arc<AtomicUsize>,
+    ip: IpAddr,
+}
+
+impl Drop for SeederConnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.counts.lock() {
+            if let Some(n) = map.get_mut(&self.ip) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    map.remove(&self.ip);
+                }
+            }
+        }
+        self.total.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Try to admit one more pre-auth seeder connection from `ip`, enforcing both
+/// `MAX_SEEDER_CONNS_PER_IP` and `MAX_SEEDER_CONNS_TOTAL`. `None` means the
+/// caller must drop the connection immediately without touching the socket
+/// further — completely ordinary behavior for a busy seeder, never a tell.
+fn try_admit_seeder_conn(
+    counts: &Arc<StdMutex<HashMap<IpAddr, usize>>>,
+    total: &Arc<AtomicUsize>,
+    ip: IpAddr,
+) -> Option<SeederConnGuard> {
+    // Reserve the global slot first via a CAS loop: if the per-IP check below
+    // then rejects, give it back — but never briefly over-book the global
+    // count in the meantime.
+    loop {
+        let cur = total.load(Ordering::Relaxed);
+        if cur >= super::config::MAX_SEEDER_CONNS_TOTAL {
+            return None;
+        }
+        if total
+            .compare_exchange(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+
+    let mut map = match counts.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let slot = map.entry(ip).or_insert(0);
+    if *slot >= super::config::MAX_SEEDER_CONNS_PER_IP {
+        drop(map);
+        total.fetch_sub(1, Ordering::Relaxed);
+        return None;
+    }
+    *slot += 1;
+    drop(map);
+
+    Some(SeederConnGuard {
+        counts: counts.clone(),
+        total: total.clone(),
+        ip,
+    })
 }
 
 // ── Server ──────────────────────────────────────────────────────────────────
@@ -175,6 +276,17 @@ pub(crate) struct TunnelServer {
     /// [`CarrierWire::establish`] in [`accept`](Self::accept) to present a real
     /// BitTorrent peer wire.
     carrier_store: Arc<TunnelCarrierStore>,
+    /// Bounds how many peers we serve `Piece`s to concurrently (choke/upload
+    /// slot semantics — Plan B Task 2). Acquired (non-blocking) in `accept`
+    /// right after the carrier handshake; released as soon as `accept`
+    /// returns (promoted or not) — see the comment there.
+    upload_slots: Arc<Semaphore>,
+    /// Per-IP in-flight pre-auth seeder connection counts, for
+    /// `MAX_SEEDER_CONNS_PER_IP` (checked in `run`'s accept loop).
+    seeder_conns: Arc<StdMutex<HashMap<IpAddr, usize>>>,
+    /// Global in-flight pre-auth seeder connection count, for
+    /// `MAX_SEEDER_CONNS_TOTAL`.
+    seeder_conns_total: Arc<AtomicUsize>,
 }
 
 impl TunnelServer {
@@ -189,6 +301,9 @@ impl TunnelServer {
             options,
             peers: RwLock::new(HashMap::new()),
             carrier_store,
+            upload_slots: Arc::new(Semaphore::new(super::config::SEEDER_UPLOAD_SLOTS)),
+            seeder_conns: Arc::new(StdMutex::new(HashMap::new())),
+            seeder_conns_total: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -228,7 +343,38 @@ impl TunnelServer {
         .map_err(|e| TunnelAdmissionError::CarrierHandshakeFailed(anyhow::anyhow!("{e}")))?;
         let (mut read_half, mut write_half, mut carrier_peer) = wire.into_halves();
 
-        // ── Step 3: seed cover until a valid allowlisted Noise promotes ─────
+        // ── Step 2.5: upload-slot admission (choke/unchoke, Plan B Task 2) ──
+        //
+        // `establish()` just unconditionally sent this peer an optimistic
+        // `Unchoke` (see `carrier_peer::TunnelCarrierPeer::initial_messages`;
+        // unchanged from before this task). A real seeder doesn't actually
+        // SERVE everyone it optimistically unchokes: `SEEDER_UPLOAD_SLOTS`
+        // bounds how many peers we serve `Piece`s to concurrently, SERVER-WIDE
+        // (distinct from the per-connection pieces cap enforced below inside
+        // `on_request` — this one caps aggregate concurrency across ALL
+        // connections). If no slot is free we immediately re-choke — sending
+        // an explicit `Choke` is a completely ordinary "reconsidered the
+        // optimistic unchoke" BT pattern — so `on_request` refuses to serve.
+        //
+        // The permit is held only for the rest of THIS function call (through
+        // `seed_until_promoted`): it is dropped as soon as `accept` returns,
+        // whether the peer promoted, timed out, or disconnected, freeing the
+        // slot immediately. Post-auth cover traffic is two `Request`s total
+        // (see `client_mux.rs`) and doesn't need the same pre-auth resource
+        // bound reasoning, so the slot needn't be held through the relay.
+        let _upload_permit = match self.upload_slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                carrier_peer.set_local_choked(true);
+                // Best-effort: if the peer already vanished, `seed_until_promoted`
+                // observes that on its next read regardless.
+                let _ = write_half.send_message(&Message::Choke).await;
+                None
+            }
+        };
+
+        // ── Step 3: seed cover until a valid allowlisted Noise promotes,
+        // bounded by the overall (non-resetting) seed-window deadline ───────
         match seed_until_promoted(
             &mut read_half,
             &mut write_half,
@@ -236,6 +382,7 @@ impl TunnelServer {
             &self.options.identity_key,
             &self.options.allowed_client_keys,
             super::config::SEEDER_IDLE,
+            super::config::SEED_WINDOW_DEADLINE,
         )
         .await?
         {
@@ -277,10 +424,33 @@ impl TunnelServer {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, addr)) => {
+                            // Per-IP + global in-flight connection caps: an
+                            // over-cap connection is dropped immediately,
+                            // before the MSE/BT handshake even starts —
+                            // exactly what a busy real seeder does, not a
+                            // tell to a censor.
+                            let guard = match try_admit_seeder_conn(
+                                &self.seeder_conns,
+                                &self.seeder_conns_total,
+                                addr.ip(),
+                            ) {
+                                Some(guard) => guard,
+                                None => {
+                                    tracing::debug!(
+                                        %addr,
+                                        "seeder connection cap reached; dropping"
+                                    );
+                                    continue;
+                                }
+                            };
                             let server = Arc::clone(self);
                             let egress = egress.clone();
                             let peer_shutdown = shutdown.child_token();
                             tokio::spawn(async move {
+                                // Held for the task's whole lifetime; its Drop
+                                // decrements the per-IP/global counts on every
+                                // exit path (promoted, seeded-out, error).
+                                let _guard = guard;
                                 match server.accept(stream, carrier_hash).await {
                                     Ok(AcceptOutcome::Admitted(peer)) => {
                                         let client_key = peer.client_key.clone();
@@ -473,6 +643,7 @@ mod tests {
                 &identity_key,
                 &allowed,
                 std::time::Duration::from_millis(500),
+                std::time::Duration::from_secs(5),
             )
             .await
         });
@@ -574,6 +745,7 @@ mod tests {
                 &identity_key,
                 &allowed,
                 std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
             )
             .await
         });
@@ -610,5 +782,247 @@ mod tests {
             Some((_transport, key)) => assert_eq!(key, client_pk, "promoted client key mismatch"),
             None => panic!("expected promotion for a valid allowlisted Noise handshake"),
         }
+    }
+
+    // ── Overall seed-window deadline (Plan B, Task 2) ────────────────────────
+
+    /// THE bug this task closes: `idle` alone resets on every message, so a
+    /// peer streaming `Request`s just fast enough to never go idle could stay
+    /// in the pre-auth seed loop indefinitely (unbounded disk reads + `Piece`
+    /// writes + a fresh snow responder per `rq_tunnel` blob). The overall
+    /// `deadline` must cut the loop off REGARDLESS of that activity.
+    #[tokio::test]
+    async fn seed_until_promoted_overall_deadline_fires_despite_continuous_activity() {
+        use super::super::carrier_wire::CarrierWire;
+        use peer_binary_protocol::{Message, Request};
+
+        let identity_key = server_key();
+        let (_dir, store) = test_carrier_store(&identity_key).await;
+        let info_hash = store.descriptor().handshake_info_hash;
+        let carrier_hash = Id20::new([0xD1; 20]);
+        let allowed = allowed_client_keys(&[known_key()]);
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server_store = store.clone();
+
+        // Idle timeout is generous (10s) so it would never fire on its own;
+        // the overall deadline (200ms) must still cut the loop off.
+        let server_task = tokio::spawn(async move {
+            let enc = PeerWireCrypto::responder(server_io, carrier_hash)
+                .await
+                .expect("server MSE responder");
+            let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
+                .await
+                .expect("server carrier establish");
+            let (mut read_half, mut write_half, mut carrier_peer) = wire.into_halves();
+            let start = std::time::Instant::now();
+            let result = seed_until_promoted(
+                &mut read_half,
+                &mut write_half,
+                &mut carrier_peer,
+                &identity_key,
+                &allowed,
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+            (result, start.elapsed())
+        });
+
+        let enc = PeerWireCrypto::initiator(client_io, carrier_hash)
+            .await
+            .expect("client MSE initiator");
+        let wire = CarrierWire::establish(enc.reader, enc.writer, store.clone(), info_hash)
+            .await
+            .expect("client carrier establish");
+        let (mut read_half, mut write_half, _client_carrier_peer) = wire.into_halves();
+
+        // Stream Requests fast enough that the idle timeout (10s) never has a
+        // chance to fire, for longer than the overall deadline (200ms).
+        let sender = tokio::spawn(async move {
+            for _ in 0..40 {
+                if write_half
+                    .send_message(&Message::Request(Request::new(0, 0, 16384)))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+        // Drain the server's Piece cover so its writer never blocks.
+        let drain = tokio::spawn(async move {
+            loop {
+                match read_half.recv_message().await {
+                    Ok(Some(_)) => continue,
+                    _ => break,
+                }
+            }
+        });
+
+        let (result, elapsed) = server_task.await.expect("server task join");
+        let outcome = result.expect("seed_until_promoted must not error");
+        assert!(
+            outcome.is_none(),
+            "expected no promotion (peer never authenticated), got {outcome:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "overall deadline (200ms) must cut the loop off despite continuous \
+             activity keeping the idle timeout (10s) from ever firing; took {elapsed:?}"
+        );
+
+        let _ = sender.await;
+        drain.abort();
+    }
+
+    // ── Upload slots (Plan B, Task 2) ────────────────────────────────────────
+
+    /// With every `SEEDER_UPLOAD_SLOTS` permit already held elsewhere,
+    /// `accept` must immediately re-choke a freshly-established peer (the
+    /// `Unchoke` `establish` just sent it is reconsidered) — proof the
+    /// server-wide upload-slot admission in `accept` actually fires.
+    #[tokio::test]
+    async fn accept_rechokes_when_upload_slots_exhausted() {
+        use super::super::carrier_wire::CarrierWire;
+        use peer_binary_protocol::Message;
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        let identity_key = server_key();
+        let (_dir, store) = test_carrier_store(&identity_key).await;
+        let info_hash = store.descriptor().handshake_info_hash;
+        let opts = test_server_options(allowed_client_keys(&[known_key()]));
+        let server = TunnelServer::new(opts, store.clone());
+
+        // Exhaust every upload slot up front, held for the whole test.
+        let held_permits: Vec<_> = (0..super::super::config::SEEDER_UPLOAD_SLOTS)
+            .map(|_| server.upload_slots.clone().try_acquire_owned().unwrap())
+            .collect();
+
+        let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let listen_addr = listener.local_addr().unwrap();
+        let carrier_hash = Id20::new([0xD2; 20]);
+
+        let server_clone = server.clone();
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("listener accept");
+            server_clone.accept(stream, carrier_hash).await
+        });
+
+        let client_stream = tokio::net::TcpStream::connect(listen_addr)
+            .await
+            .expect("client connect");
+        let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
+            .await
+            .expect("client MSE initiator");
+        let wire = CarrierWire::establish(enc.reader, enc.writer, store, info_hash)
+            .await
+            .expect("client carrier establish");
+        let (mut read_half, write_half, _peer) = wire.into_halves();
+
+        // The server's own `establish()` already sent Bitfield/Unchoke/
+        // Interested; with every upload slot exhausted, `accept` must follow
+        // up with an explicit Choke.
+        let mut saw_choke = false;
+        for _ in 0..8 {
+            match read_half.recv_message().await.expect("recv") {
+                Some(Message::Choke) => {
+                    saw_choke = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert!(
+            saw_choke,
+            "expected an explicit Choke once upload slots are exhausted"
+        );
+
+        drop(read_half);
+        drop(write_half);
+        let _ = accept_task.await;
+        drop(held_permits);
+    }
+
+    // ── Pre-auth connection admission caps (Plan B, Task 2) ──────────────────
+    //
+    // Pure unit tests of the cap-counter logic in isolation (per the task
+    // brief: "simpler to test, the cap counter logic in isolation") — no
+    // networking, so these are plain `#[test]`s.
+
+    #[test]
+    fn seeder_conn_cap_rejects_beyond_per_ip_limit() {
+        use std::net::Ipv4Addr;
+
+        let counts: Arc<StdMutex<HashMap<IpAddr, usize>>> = Arc::new(StdMutex::new(HashMap::new()));
+        let total = Arc::new(AtomicUsize::new(0));
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+        let mut guards = Vec::new();
+        for i in 0..super::super::config::MAX_SEEDER_CONNS_PER_IP {
+            let g = try_admit_seeder_conn(&counts, &total, ip)
+                .unwrap_or_else(|| panic!("connection {i} within the per-IP cap must be admitted"));
+            guards.push(g);
+        }
+
+        assert!(
+            try_admit_seeder_conn(&counts, &total, ip).is_none(),
+            "connection beyond MAX_SEEDER_CONNS_PER_IP must be rejected"
+        );
+
+        // A different source IP is unaffected by the first IP's cap.
+        let other_ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        assert!(
+            try_admit_seeder_conn(&counts, &total, other_ip).is_some(),
+            "a different source IP must not be capped by the first IP's connections"
+        );
+
+        // Dropping a guard (RAII) must free a per-IP slot.
+        guards.pop();
+        assert!(
+            try_admit_seeder_conn(&counts, &total, ip).is_some(),
+            "dropping a guard must free a per-IP slot"
+        );
+    }
+
+    #[test]
+    fn seeder_conn_cap_rejects_beyond_global_limit() {
+        use std::net::Ipv4Addr;
+
+        let counts: Arc<StdMutex<HashMap<IpAddr, usize>>> = Arc::new(StdMutex::new(HashMap::new()));
+        let total = Arc::new(AtomicUsize::new(0));
+
+        // Spread connections across many distinct IPs (each well under its
+        // own per-IP cap) so only the GLOBAL cap is exercised.
+        let mut guards = Vec::new();
+        for i in 0..super::super::config::MAX_SEEDER_CONNS_TOTAL {
+            let ip = IpAddr::V4(Ipv4Addr::from(i as u32));
+            let g = try_admit_seeder_conn(&counts, &total, ip)
+                .unwrap_or_else(|| panic!("connection {i} within the global cap must be admitted"));
+            guards.push(g);
+        }
+
+        let fresh_ip = IpAddr::V4(Ipv4Addr::from(
+            super::super::config::MAX_SEEDER_CONNS_TOTAL as u32,
+        ));
+        assert!(
+            try_admit_seeder_conn(&counts, &total, fresh_ip).is_none(),
+            "connection beyond MAX_SEEDER_CONNS_TOTAL must be rejected even from a fresh IP"
+        );
+        assert_eq!(
+            total.load(Ordering::Relaxed),
+            super::super::config::MAX_SEEDER_CONNS_TOTAL
+        );
+
+        // Dropping a guard (RAII) must free a global slot.
+        guards.pop();
+        assert!(
+            try_admit_seeder_conn(&counts, &total, fresh_ip).is_some(),
+            "dropping a guard must free a global slot"
+        );
     }
 }

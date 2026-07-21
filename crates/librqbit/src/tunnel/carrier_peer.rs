@@ -178,11 +178,20 @@ impl CarrierPieceLayer {
 pub(crate) struct TunnelCarrierPeer {
     carrier: Arc<TunnelCarrierStore>,
     remote_have: BitBox<u8, Msb0>,
-    // Reserved for choking the remote from our side; no handler flips this
-    // yet (only `remote_choked`, tracking the peer's Choke/Unchoke, is read).
-    #[allow(dead_code)]
+    /// Whether WE are choking this peer — i.e. refusing to answer its
+    /// `Request`s with `Piece`s. Gates `on_request` (Plan B Task 2: seeder
+    /// realism + a pre-auth resource bound). Starts choked; `initial_messages`
+    /// optimistically unchokes (matching real BT clients, which commonly
+    /// extend an initial optimistic unchoke before deciding whether to keep
+    /// serving), and `server.rs`'s upload-slot admission may immediately
+    /// re-choke right after if no slot is free. `on_request` also forces this
+    /// back to `true` once `MAX_SEEDER_PIECES_PER_CONN` is reached, mimicking
+    /// a real overloaded seeder.
     local_choked: bool,
     remote_choked: bool,
+    /// Count of `Piece`s served to this peer's `Request`s this connection.
+    /// Capped at `MAX_SEEDER_PIECES_PER_CONN` — see `local_choked`.
+    pieces_served: usize,
     layer: CarrierPieceLayer,
 }
 
@@ -191,16 +200,36 @@ impl TunnelCarrierPeer {
         let layer = CarrierPieceLayer::from_descriptor(&carrier.descriptor().metainfo)?;
         Ok(Self {
             remote_have: bitvec::bitbox![u8, Msb0; 0; layer.npieces()],
-            local_choked: false,
+            local_choked: true,
             remote_choked: true,
+            pieces_served: 0,
             carrier,
             layer,
         })
     }
 
+    // ── Choke state (Plan B Task 2: upload slots) ─────────────────────────
+
+    /// Set whether we are choking this peer. `false` (unchoked) lets
+    /// `on_request` actually serve `Piece`s; `true` makes it a silent no-op —
+    /// exactly real BT choke semantics (a choked peer's `Request`s just go
+    /// unanswered, no explicit rejection). Called by `server.rs`'s
+    /// upload-slot admission.
+    pub(crate) fn set_local_choked(&mut self, choked: bool) {
+        self.local_choked = choked;
+    }
+
+    /// Whether we are currently choking this peer. Test-only: production code
+    /// only ever SETS this (`set_local_choked`); the enforcement itself lives
+    /// in `on_request`.
+    #[cfg(test)]
+    pub(crate) fn is_local_choked(&self) -> bool {
+        self.local_choked
+    }
+
     // ── Initial messages ──────────────────────────────────────────────────
 
-    pub fn initial_messages(&self) -> Vec<CoverMessage> {
+    pub fn initial_messages(&mut self) -> Vec<CoverMessage> {
         let have = self.carrier.have_bitfield();
         let bitfield_bytes = have.len().div_ceil(8);
         let mut buf = vec![0u8; bitfield_bytes];
@@ -213,6 +242,9 @@ impl TunnelCarrierPeer {
                 buf[byte_idx] |= 1 << bit_idx;
             }
         }
+
+        // Optimistic unchoke at connect (see `local_choked`'s doc comment).
+        self.local_choked = false;
 
         vec![
             CoverMessage::Bitfield(bytes::Bytes::from(buf)),
@@ -243,6 +275,13 @@ impl TunnelCarrierPeer {
     // ── Handlers ──────────────────────────────────────────────────────────
 
     async fn on_request(&mut self, req: Request) -> Result<Vec<CarrierAction>, TunnelCarrierError> {
+        // A choked peer's `Request`s go unanswered — real BT choke semantics
+        // (silence, not an explicit rejection) and the primary pre-auth
+        // resource bound here: no disk read, no `Piece` write, no serialize.
+        if self.local_choked {
+            return Ok(vec![]);
+        }
+
         let idx = req.index;
         let begin = req.begin;
         let length = req.length;
@@ -299,8 +338,20 @@ impl TunnelCarrierPeer {
             begin,
             data: bytes::Bytes::copy_from_slice(block),
         };
+        let mut actions = vec![CarrierAction::OutgoingMessage(piece_msg)];
 
-        Ok(vec![CarrierAction::OutgoingMessage(piece_msg)])
+        // Per-connection pieces-served cap (Plan B Task 2): after serving
+        // `MAX_SEEDER_PIECES_PER_CONN` pieces to this peer, self-choke — a
+        // real overloaded seeder stops serving rather than serving forever.
+        // A legitimate client authenticates almost immediately and never
+        // comes close to this cap.
+        self.pieces_served += 1;
+        if self.pieces_served >= super::config::MAX_SEEDER_PIECES_PER_CONN {
+            self.local_choked = true;
+            actions.push(CarrierAction::OutgoingMessage(CoverMessage::Choke));
+        }
+
+        Ok(actions)
     }
 
     async fn on_piece(
@@ -486,16 +537,24 @@ mod tests {
         (Arc::new(store), dir)
     }
 
+    /// Builds an UNCHOKED peer (as if it had already been granted an upload
+    /// slot) — the request-handling / bitfield / piece tests below are about
+    /// validation and cover-serving logic, not the new choke gating (Plan B
+    /// Task 2, covered separately below), so they need a peer that actually
+    /// serves. `TunnelCarrierPeer::new` alone now starts CHOKED (a real
+    /// seeder's default) — see the "Local choke gating" tests below for that.
     async fn test_peer() -> (TunnelCarrierPeer, tempfile::TempDir) {
         let (store, dir) = test_store().await;
-        (TunnelCarrierPeer::new(store).unwrap(), dir)
+        let mut peer = TunnelCarrierPeer::new(store).unwrap();
+        peer.set_local_choked(false);
+        (peer, dir)
     }
 
     // ── Initial messages ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn initial_messages_sends_bitfield_and_unchoke() {
-        let (peer, _dir) = test_peer().await;
+        let (mut peer, _dir) = test_peer().await;
         let msgs = peer.initial_messages();
 
         assert_eq!(msgs.len(), 2, "expected bitfield + unchoke");
@@ -773,5 +832,134 @@ mod tests {
 
         let actions = peer.on_message(Message::KeepAlive).await.unwrap();
         assert!(actions.is_empty());
+    }
+
+    // ── Local choke gating (Plan B Task 2: upload slots) ───────────────────
+    //
+    // Distinct from `remote_choked` above (which tracks whether the REMOTE
+    // peer is choking US): `local_choked` gates whether WE serve `Piece`s to
+    // THEIR `Request`s — the seeder-realism + pre-auth resource bound this
+    // task adds.
+
+    #[tokio::test]
+    async fn choked_peer_request_yields_no_piece_until_unchoked() {
+        let (store, _dir) = test_store().await;
+        let mut peer = TunnelCarrierPeer::new(store).unwrap();
+
+        // A brand-new peer starts choked: a real seeder's default.
+        assert!(peer.is_local_choked(), "new peer must start locally choked");
+
+        let actions = peer
+            .on_message(Message::Request(Request::new(0, 0, 16384)))
+            .await
+            .unwrap();
+        assert!(
+            actions.is_empty(),
+            "a choked peer's Request must yield NO Piece, got {actions:?}"
+        );
+
+        // Grant an upload slot (what `server.rs`'s admission does on success).
+        peer.set_local_choked(false);
+        assert!(!peer.is_local_choked());
+
+        let actions = peer
+            .on_message(Message::Request(Request::new(0, 0, 16384)))
+            .await
+            .unwrap();
+        assert_eq!(actions.len(), 1, "expected one Piece action once unchoked");
+        assert!(
+            matches!(
+                &actions[0],
+                CarrierAction::OutgoingMessage(CoverMessage::Piece { .. })
+            ),
+            "expected Piece, got {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rechoking_stops_further_service() {
+        let (mut peer, _dir) = test_peer().await; // starts unchoked
+
+        let actions = peer
+            .on_message(Message::Request(Request::new(0, 0, 16384)))
+            .await
+            .unwrap();
+        assert_eq!(actions.len(), 1, "expected a Piece while unchoked");
+
+        peer.set_local_choked(true);
+        let actions = peer
+            .on_message(Message::Request(Request::new(0, 0, 16384)))
+            .await
+            .unwrap();
+        assert!(
+            actions.is_empty(),
+            "expected no Piece once re-choked, got {actions:?}"
+        );
+    }
+
+    // ── Per-connection pieces-served cap (Plan B Task 2) ───────────────────
+
+    #[tokio::test]
+    async fn pieces_cap_self_chokes_after_max_served() {
+        use super::super::config::MAX_SEEDER_PIECES_PER_CONN;
+
+        let (mut peer, _dir) = test_peer().await; // starts unchoked
+
+        // Serve exactly the cap's worth of pieces; every one must be served.
+        for n in 0..MAX_SEEDER_PIECES_PER_CONN {
+            let actions = peer
+                .on_message(Message::Request(Request::new(0, 0, 16384)))
+                .await
+                .unwrap();
+            let has_piece = actions.iter().any(|a| {
+                matches!(
+                    a,
+                    CarrierAction::OutgoingMessage(CoverMessage::Piece { .. })
+                )
+            });
+            assert!(has_piece, "request {n} (within cap) must be served");
+        }
+
+        // The cap must have flipped local_choked and emitted an explicit
+        // Choke somewhere along the way (on the Nth, cap-reaching request).
+        assert!(
+            peer.is_local_choked(),
+            "peer must be self-choked once the pieces cap is reached"
+        );
+
+        // The (N+1)th Request must NOT be served.
+        let actions = peer
+            .on_message(Message::Request(Request::new(0, 0, 16384)))
+            .await
+            .unwrap();
+        assert!(
+            actions.is_empty(),
+            "request beyond the pieces cap must not be served, got {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pieces_cap_reaching_request_emits_explicit_choke() {
+        use super::super::config::MAX_SEEDER_PIECES_PER_CONN;
+
+        let (mut peer, _dir) = test_peer().await; // starts unchoked
+
+        let mut saw_choke = false;
+        for _ in 0..MAX_SEEDER_PIECES_PER_CONN {
+            let actions = peer
+                .on_message(Message::Request(Request::new(0, 0, 16384)))
+                .await
+                .unwrap();
+            if actions
+                .iter()
+                .any(|a| matches!(a, CarrierAction::OutgoingMessage(CoverMessage::Choke)))
+            {
+                saw_choke = true;
+            }
+        }
+        assert!(
+            saw_choke,
+            "the request that reaches the pieces cap must emit an explicit Choke"
+        );
     }
 }
