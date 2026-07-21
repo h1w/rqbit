@@ -195,7 +195,24 @@ impl TunnelCarrierStore {
         let corpus_path = root.join(CORPUS_FILENAME);
 
         if desc_path.exists() {
-            Self::reopen(root, config, &desc_path, &corpus_path).await
+            // A descriptor exists: try to reopen it. If reopen fails for a
+            // RECOVERABLE local-state mismatch (corpus size / piece-hash /
+            // merkle-root mismatch, a corrupt or partially-written descriptor, or
+            // a leftover dir generated from a DIFFERENT config), self-heal by
+            // regenerating from `config` rather than propagating a hard error to
+            // the caller — the carrier is deterministic local state, so
+            // regenerating is always safe and yields the correct torrent.
+            match Self::reopen(root, config, &desc_path, &corpus_path).await {
+                Ok(store) => Ok(store),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        dir = %root.display(),
+                        "carrier store reopen failed; regenerating from config (self-heal)"
+                    );
+                    Self::initialize(root, config, &desc_path, &corpus_path).await
+                }
+            }
         } else {
             Self::initialize(root, config, &desc_path, &corpus_path).await
         }
@@ -480,18 +497,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_reopen_with_mismatched_config() {
+    async fn self_heals_reopen_with_mismatched_config() {
         let dir = tempfile::tempdir().unwrap();
         TunnelCarrierStore::open_or_initialize(dir.path(), &test_config())
             .await
             .unwrap();
 
+        // A config whose seed AND size differ from what's on disk. `reopen`
+        // cannot validate the stale corpus against it, so `open_or_initialize`
+        // must SELF-HEAL: regenerate from `bad_config` and return ITS descriptor
+        // (not the stale one), rather than propagating an error.
         let bad_config = TunnelCarrierConfig {
             corpus_bytes: 32768, // different size
+            seed: [5u8; 32],     // different seed
             ..test_config()
         };
-        let result = TunnelCarrierStore::open_or_initialize(dir.path(), &bad_config).await;
-        assert!(result.is_err());
+        let healed = TunnelCarrierStore::open_or_initialize(dir.path(), &bad_config)
+            .await
+            .expect("mismatched existing dir must self-heal, not error");
+
+        // The healed store must reflect `bad_config`. Compare against a fresh
+        // store built from `bad_config` in a clean dir.
+        let clean = tempfile::tempdir().unwrap();
+        let expected = TunnelCarrierStore::open_or_initialize(clean.path(), &bad_config)
+            .await
+            .unwrap();
+        assert_eq!(
+            healed.descriptor(),
+            expected.descriptor(),
+            "self-healed store must match a fresh store built from the new config"
+        );
+
+        // And a subsequent reopen with the SAME (healed) config now succeeds
+        // cleanly — the on-disk state was rewritten to match.
+        let reopened = TunnelCarrierStore::open_or_initialize(dir.path(), &bad_config)
+            .await
+            .expect("reopen after self-heal must succeed");
+        assert_eq!(reopened.descriptor(), expected.descriptor());
+    }
+
+    #[tokio::test]
+    async fn self_heals_reopen_with_corrupt_corpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config();
+        let original = TunnelCarrierStore::open_or_initialize(dir.path(), &cfg)
+            .await
+            .unwrap();
+        let original_desc = original.descriptor().clone();
+        drop(original);
+
+        // Corrupt the corpus in place WITHOUT changing its size: the size check
+        // passes, but the piece-hash / merkle-root check fails on reopen — a
+        // different recoverable failure path than a size/config mismatch.
+        let corpus_path = dir.path().join(CORPUS_FILENAME);
+        let mut bytes = std::fs::read(&corpus_path).unwrap();
+        bytes[0] ^= 0xFF;
+        std::fs::write(&corpus_path, &bytes).unwrap();
+
+        // Self-heal: reopen must SUCCEED and regenerate the correct torrent
+        // (identical to the original, since the seed is unchanged).
+        let healed = TunnelCarrierStore::open_or_initialize(dir.path(), &cfg)
+            .await
+            .expect("corrupt corpus must self-heal, not error");
+        assert_eq!(
+            healed.descriptor(),
+            &original_desc,
+            "self-healed store must match the original (same seed regenerates identically)"
+        );
+
+        // A subsequent clean reopen now succeeds: the on-disk corpus was rewritten
+        // consistent with the descriptor.
+        let reopened = TunnelCarrierStore::open_or_initialize(dir.path(), &cfg)
+            .await
+            .expect("reopen after self-heal must succeed");
+        assert_eq!(reopened.descriptor(), &original_desc);
     }
 
     #[tokio::test]

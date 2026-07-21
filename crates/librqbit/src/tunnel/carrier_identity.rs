@@ -67,7 +67,13 @@ pub(crate) async fn build_carrier_store(
 ) -> anyhow::Result<Arc<TunnelCarrierStore>> {
     let carrier_hash = derive_carrier_hash(server_pub);
     let config = carrier_config_for(&carrier_hash);
-    let store = TunnelCarrierStore::open_or_initialize(root, &config).await?;
+    // Namespace the on-disk store per server key so two different servers never
+    // collide in the same `root`. Without this, a stale dir left by server A —
+    // whose corpus happens to match B's size — would `reopen` cleanly and
+    // silently hand back A's (wrong) torrent for B. A distinct `server_pub` maps
+    // to a distinct subdir, hence B's own (correct) seed.
+    let store_dir = root.join(hex::encode(server_pub.0));
+    let store = TunnelCarrierStore::open_or_initialize(&store_dir, &config).await?;
     Ok(Arc::new(store))
 }
 
@@ -100,6 +106,42 @@ mod tests {
         let cfg = carrier_config_for(&Id20::new([42u8; 20]));
         assert!(cfg.corpus_bytes >= super::super::config::CARRIER_CORPUS_MIN);
         assert!(cfg.corpus_bytes <= super::super::config::CARRIER_CORPUS_MAX);
+    }
+
+    #[tokio::test]
+    async fn different_server_keys_get_different_subdirs_and_descriptors() {
+        let root = tempfile::tempdir().unwrap();
+
+        let key_a = TunnelPublicKey([1u8; 32]);
+        let key_b = TunnelPublicKey([2u8; 32]);
+
+        let store_a = build_carrier_store(root.path(), &key_a).await.unwrap();
+        let store_b = build_carrier_store(root.path(), &key_b).await.unwrap();
+
+        // Two different server keys must NOT collide in the same root: each maps
+        // to a distinct per-key subdir with its own descriptor on disk.
+        let dir_a = root.path().join(hex::encode(key_a.0));
+        let dir_b = root.path().join(hex::encode(key_b.0));
+        assert_ne!(dir_a, dir_b, "per-key subdirs must differ");
+        assert!(
+            dir_a.join("carrier-descriptor.bin").exists(),
+            "server A descriptor must live under its own subdir"
+        );
+        assert!(
+            dir_b.join("carrier-descriptor.bin").exists(),
+            "server B descriptor must live under its own subdir"
+        );
+
+        // And each store carries its OWN (correct) torrent, not the other's.
+        assert_ne!(
+            store_a.descriptor().info_hash,
+            store_b.descriptor().info_hash,
+            "different server keys must yield different carrier torrents"
+        );
+        assert_ne!(
+            store_a.descriptor().handshake_info_hash,
+            store_b.descriptor().handshake_info_hash,
+        );
     }
 
     #[tokio::test]
