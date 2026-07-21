@@ -737,7 +737,7 @@ The relay uses two tasks (reader + paced writer) sharing `Arc<Mutex<NoiseTranspo
     - `pub(crate) async fn send_tunnel(&mut self, payload: &[u8]) -> Result<(), CarrierWireError>` (writes ONE rq_tunnel message; caller pre-chunks)
     - `pub(crate) async fn send_message(&mut self, msg: &Message<'_>) -> Result<(), CarrierWireError>`
   - `pub(crate) struct CarrierReadHalf { reader: BoxAsyncReadVectored, read_buf: ReadBuf }`
-    - `pub(crate) async fn recv_message(&mut self) -> Result<Option<Message<'static>>, CarrierWireError>`
+    - `pub(crate) async fn recv_message(&mut self) -> Result<Option<Message<'_>>, CarrierWireError>` — returns a message BORROWING `self` (no owned clone; `Message` does not implement `CloneToOwned`). The caller processes it inline before the next call, exactly as `recv_tunnel` does today.
   - `CarrierWire::into_halves(self) -> (CarrierReadHalf, CarrierWriteHalf, TunnelCarrierPeer)`
 
 - [ ] **Step 1: Write the failing test**
@@ -832,12 +832,20 @@ pub(crate) struct CarrierReadHalf {
 }
 
 impl CarrierReadHalf {
-    /// Read exactly one BT peer message. `Ok(None)` on clean disconnect.
+    /// Read exactly one BT peer message, BORROWING the internal read buffer.
+    /// `Ok(None)` on clean disconnect. The returned message borrows `self`, so
+    /// the caller must finish using it before the next call (streaming pattern,
+    /// identical to `recv_tunnel`'s internal loop). `Message` does NOT implement
+    /// `CloneToOwned`, so we do not attempt to return an owned `Message<'static>`.
     pub(crate) async fn recv_message(
         &mut self,
-    ) -> Result<Option<Message<'static>>, CarrierWireError> {
-        match self.read_buf.read_message(&mut self.reader, WIRE_TIMEOUT).await {
-            Ok(m) => Ok(Some(m.clone_to_owned(None))),
+    ) -> Result<Option<Message<'_>>, CarrierWireError> {
+        match self
+            .read_buf
+            .read_message(&mut self.reader, WIRE_TIMEOUT)
+            .await
+        {
+            Ok(m) => Ok(Some(m)),
             Err(e) => {
                 tracing::debug!(error = %e, "carrier wire read ended");
                 Ok(None)
@@ -866,11 +874,7 @@ impl CarrierWire {
 }
 ```
 
-Note on `clone_to_owned`: `peer_binary_protocol::Message` implements `clone_to_owned(&self, None) -> Message<'static>` via the `clone_to_owned` crate (used across the codebase). Verify the exact method name with:
-
-Run: `rg -n "clone_to_owned" crates/peer_binary_protocol/src/lib.rs | head`
-
-If `Message` exposes it as `msg.clone_to_owned(None)`, use that. If the signature differs (e.g. no arg), adjust the single call in `recv_message` accordingly. This is the one API detail to confirm before writing the impl.
+Resolved API note (controller-verified): `peer_binary_protocol::Message` does NOT implement `CloneToOwned` (only `Piece` does), so there is no owned-`Message<'static>` conversion. `recv_message` therefore returns a BORROWED `Message<'_>`, and callers process it inline — `rq_tunnel` payloads are copied to `Bytes`, and cover messages are handed to `carrier_peer.on_message(msg)` (which takes `Message<'_>` and returns already-`'static` `CarrierAction::OutgoingMessage`). No `clone_to_owned` call is used anywhere in this task.
 
 - [ ] **Step 4: Run test to verify it passes**
 
