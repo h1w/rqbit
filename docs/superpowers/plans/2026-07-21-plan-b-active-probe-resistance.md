@@ -138,6 +138,11 @@ NOTE the two removed tells: (a) `Request`s are now served during the wait; (b) a
 
 A real seeder chokes most peers and bounds resources. Add: choke-by-default with a small number of unchoke (upload) slots, a per-IP and global connection cap in the accept loop, and confirm the idle timeout.
 
+**REQUIRED (from Task 1 review — closes a real pre-auth amplification DoS):** the seed loop's idle `tokio::time::timeout` RESETS on every message, so a peer that streams periodic `Request`s drives unbounded `read_piece` (256 KiB disk read each) + Piece-serialize/write, plus a fresh snow responder per ≤512B rq_tunnel blob — with NO bound today. Task 2 MUST add, in addition to upload slots + conn caps:
+- an **overall seed-window deadline** (a single `tokio::time::timeout(SEED_WINDOW_DEADLINE, ...)` around the WHOLE `seed_until_promoted`, NOT reset by activity — mirror `establish`'s `ESTABLISH_DEADLINE`), and
+- a **per-connection cap on pieces served** (`MAX_SEEDER_PIECES_PER_CONN`): after serving N pieces to one unauthenticated peer, `Choke` it (stop serving) — a real overloaded seeder does exactly this. A legitimate client that promotes quickly never hits it.
+These bound pre-auth disk/CPU/bandwidth so an attacker knowing `server_pub` can't amplify beyond a normal choking seeder.
+
 **Files:**
 - Modify: `carrier_peer.rs` (choke state: only serve `Request` when the peer is unchoked; start choked, unchoke up to N)
 - Modify: `server.rs` `run` accept loop (per-IP + global in-flight connection caps)
