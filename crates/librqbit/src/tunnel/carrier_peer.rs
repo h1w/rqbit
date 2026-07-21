@@ -285,7 +285,6 @@ impl TunnelCarrierPeer {
         block: &[u8],
     ) -> Result<(), TunnelCarrierError> {
         let idx = piece_index as usize;
-        let block_len = block.len() as u32;
 
         if idx >= self.layer.npieces() {
             return Err(TunnelCarrierError::InvalidRequest {
@@ -296,10 +295,25 @@ impl TunnelCarrierPeer {
             });
         }
 
-        if begin + block_len > self.layer.piece_length {
+        // Compute the end of the block range in `usize` via checked arithmetic
+        // so an attacker-controlled `begin` near `u32::MAX` cannot wrap the
+        // bounds check (as plain u32 addition would) and then panic on the
+        // out-of-range slice below.
+        let begin_usize = begin as usize;
+        let end = begin_usize.checked_add(block.len()).ok_or_else(|| {
+            TunnelCarrierError::InvalidRequest {
+                reason: format!(
+                    "block overflow: begin={begin} + length={} overflows usize",
+                    block.len(),
+                ),
+            }
+        })?;
+
+        if end > self.layer.piece_length as usize {
             return Err(TunnelCarrierError::InvalidRequest {
                 reason: format!(
-                    "block overflow: begin={begin} + length={block_len} > piece_length={}",
+                    "block overflow: begin={begin} + length={} > piece_length={}",
+                    block.len(),
                     self.layer.piece_length,
                 ),
             });
@@ -312,8 +326,7 @@ impl TunnelCarrierPeer {
             .await
             .map_err(TunnelCarrierError::Store)?;
 
-        let begin = begin as usize;
-        let expected = &local[begin..begin + block.len()];
+        let expected = &local[begin_usize..end];
         if expected != block {
             return Err(TunnelCarrierError::PieceHashMismatch {
                 index: piece_index,
@@ -607,6 +620,19 @@ mod tests {
         assert!(
             matches!(result, Err(TunnelCarrierError::InvalidRequest { .. })),
             "expected InvalidRequest for out-of-range piece, got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_piece_with_overflowing_begin_without_panicking() {
+        let (mut peer, _dir) = test_peer().await;
+        let block = [0u8; 16];
+        let result = peer
+            .on_message(Message::Piece(Piece::from_data(0, u32::MAX - 4, &block)))
+            .await;
+        assert!(
+            matches!(result, Err(TunnelCarrierError::InvalidRequest { .. })),
+            "expected InvalidRequest, got {result:?}",
         );
     }
 

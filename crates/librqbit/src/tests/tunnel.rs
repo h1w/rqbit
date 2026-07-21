@@ -1511,6 +1511,18 @@ async fn wire_shows_real_bittorrent_events() {
     // BEP-10 extended handshake + bitfield from `build_real_relay_pair` below.
     let trace = install_carrier_trace();
 
+    // RAII guard: ensures the thread-local CARRIER_TRACE is always cleared,
+    // even if a `.expect`/`panic!`/timeout fires below before the happy-path
+    // cleanup is reached. Without this, a leftover trace can leak events into
+    // a later test scheduled on the same current-thread runtime worker.
+    struct ClearTraceGuard;
+    impl Drop for ClearTraceGuard {
+        fn drop(&mut self) {
+            clear_carrier_trace();
+        }
+    }
+    let _clear_trace_guard = ClearTraceGuard;
+
     // Real loopback echo destination for a small SOCKS-style TCP round trip.
     let echo = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .await
@@ -1580,7 +1592,6 @@ async fn wire_shows_real_bittorrent_events() {
     .expect("piece cover (Request/Piece) should appear on the wire");
 
     let events = trace.lock().events().to_vec();
-    clear_carrier_trace();
     token.cancel();
 
     assert!(
