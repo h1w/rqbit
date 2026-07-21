@@ -142,8 +142,17 @@ pub(crate) fn clear_carrier_trace() {
 fn record_carrier_event(msg: &Message<'_>) {
     CARRIER_TRACE.with(|c| {
         if let Some(sink) = c.borrow().as_ref() {
-            sink.lock()
-                .push(super::test_capture::CarrierEvent::from_message(msg));
+            let mut trace = sink.lock();
+            trace.push(super::test_capture::CarrierEvent::from_message(msg));
+            // Retain the one payload fact a cadence gate needs from the extended
+            // handshake: that it advertised `ut_metadata` and a non-zero
+            // `metadata_size` (BEP-9). The event kind alone can't carry this.
+            if let Message::Extended(ExtendedMessage::Handshake(h)) = msg {
+                trace.record_handshake_advertisement(
+                    h.m.ut_metadata.is_some(),
+                    h.metadata_size.unwrap_or(0),
+                );
+            }
         }
     });
 }

@@ -185,6 +185,51 @@ pub(crate) const MIN_PACING_RATE: u64 = MIN_TARGET as u64;
 /// sequence. Best-effort and lowest priority — below control, data, and cover.
 pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(110);
 
+// ── Cover-request cadence (carrier realism) ──────────────────────────────────
+
+/// How often the client mux issues a fresh BitTorrent piece `Request` on an
+/// active carrier so the connection exhibits ONGOING piece exchange, not a
+/// single startup burst. A real leeching BT peer keeps a steady pipeline of
+/// block requests in flight for the whole session; a masquerade carrier that
+/// fires two `Request`s at connect and then goes silent (for BT purposes) while
+/// still streaming encrypted `rq_tunnel` payload would have a tell no real
+/// downloading peer exhibits. The cadence is best-effort (`try_send`, dropped
+/// on a full cover lane — it's cover) and cheap: one small block request per
+/// tick. Kept short enough to look like an active download without adding
+/// meaningful load. The server answers each with a validated `Piece`.
+pub(crate) const COVER_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Block length (bytes) of each cover `Request` — the de-facto BitTorrent block
+/// size (16 KiB), matching `READ_CHUNK`. A real client requests pieces one
+/// 16 KiB block at a time.
+pub(crate) const COVER_REQUEST_BLOCK_LEN: u32 = 16 * 1024;
+
+/// Number of distinct low piece indices the cover cadence rotates its
+/// `Request`s across. Every synthetic carrier has at least
+/// `CARRIER_CORPUS_MIN / CARRIER_PIECE_LENGTH` pieces
+/// (`8 MiB / 256 KiB = 32`), so any index below this span is ALWAYS in range
+/// for any carrier the client could be talking to — the cadence never needs to
+/// know the exact corpus size to stay in-bounds. Rotating (rather than always
+/// hammering piece 0) looks like a client fetching different parts of the file.
+pub(crate) const COVER_REQUEST_PIECE_SPAN: u32 = 8;
+
+/// Number of 16 KiB blocks in one carrier piece
+/// (`CARRIER_PIECE_LENGTH / COVER_REQUEST_BLOCK_LEN = 16`). The cadence rotates
+/// the block offset within each piece across this many blocks so successive
+/// requests to the same piece walk its blocks like a real download, and every
+/// `(begin, length)` pair stays within `CARRIER_PIECE_LENGTH`.
+pub(crate) const COVER_REQUEST_BLOCKS_PER_PIECE: u32 =
+    CARRIER_PIECE_LENGTH / COVER_REQUEST_BLOCK_LEN;
+
+// The cover cadence's `begin + length` must never exceed a carrier piece, or
+// `TunnelCarrierPeer::on_request` rejects the request as an overflow. This
+// compile-time check makes the block-walking arithmetic un-rottable.
+const _: () = assert!(
+    (COVER_REQUEST_BLOCKS_PER_PIECE - 1) * COVER_REQUEST_BLOCK_LEN + COVER_REQUEST_BLOCK_LEN
+        <= CARRIER_PIECE_LENGTH,
+    "cover-request block walk must stay within CARRIER_PIECE_LENGTH"
+);
+
 // ── Carriers ─────────────────────────────────────────────────────────────────
 
 /// Default number of parallel carrier connections a client opens to the server.

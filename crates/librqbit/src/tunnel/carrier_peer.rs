@@ -76,6 +76,11 @@ pub(crate) enum CoverMessage {
     /// instead of a hard error/disconnect — a real client rejects rather than
     /// drops the connection over a bad metadata request.
     UtMetadataReject(u32),
+    /// A BEP-9 `ut_metadata` `request`: sent by the CLIENT cover cadence once at
+    /// connect (a real BT client that sees a peer advertise `ut_metadata` +
+    /// `metadata_size` and lacks the metadata fetches it). Serialized with the
+    /// peer's advertised `ut_metadata` id by the writer's `send_message`.
+    UtMetadataRequest(u32),
 }
 
 impl CoverMessage {
@@ -108,6 +113,9 @@ impl CoverMessage {
             ))),
             CoverMessage::UtMetadataReject(piece) => {
                 Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Reject(*piece)))
+            }
+            CoverMessage::UtMetadataRequest(piece) => {
+                Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Request(*piece)))
             }
         }
     }
@@ -214,8 +222,18 @@ pub(crate) struct TunnelCarrierPeer {
     local_choked: bool,
     remote_choked: bool,
     /// Count of `Piece`s served to this peer's `Request`s this connection.
-    /// Capped at `MAX_SEEDER_PIECES_PER_CONN` — see `local_choked`.
+    /// Capped at `MAX_SEEDER_PIECES_PER_CONN` while UNauthenticated — see
+    /// `local_choked` and `authenticated`.
     pieces_served: usize,
+    /// Whether this peer has completed the Noise handshake (been PROMOTED to an
+    /// authenticated relay carrier). The `MAX_SEEDER_PIECES_PER_CONN` self-choke
+    /// is a PRE-AUTH DoS bound only; once authenticated, the carrier's ONGOING
+    /// piece-cover cadence (see `client_mux.rs`) must be able to run for the
+    /// whole session without ever self-choking — a mid-session `Choke` that
+    /// killed the cadence would itself be a tell (and defeat the cover). Set by
+    /// `server.rs`'s `accept` on promotion; pre-auth peers stay `false` and are
+    /// bounded exactly as before.
+    authenticated: bool,
     layer: CarrierPieceLayer,
     /// Count of `ut_metadata` `request`s served this connection. Capped at
     /// `metadata_requests_cap` (unlike `pieces_served`, NOT gated by
@@ -240,6 +258,7 @@ impl TunnelCarrierPeer {
             local_choked: true,
             remote_choked: true,
             pieces_served: 0,
+            authenticated: false,
             metadata_requests_served: 0,
             metadata_requests_cap,
             carrier,
@@ -279,6 +298,23 @@ impl TunnelCarrierPeer {
     #[cfg(test)]
     pub(crate) fn pieces_served(&self) -> usize {
         self.pieces_served
+    }
+
+    /// Mark this peer as authenticated (promoted to a relay carrier). Called by
+    /// `server.rs`'s `accept` on promotion, alongside `set_local_choked(false)`
+    /// and `reset_pieces_served()`. After this, `on_request` no longer applies
+    /// the PRE-AUTH `MAX_SEEDER_PIECES_PER_CONN` self-choke, so the ongoing
+    /// piece-cover cadence can run for the whole session (see the field doc).
+    pub(crate) fn set_authenticated(&mut self, authenticated: bool) {
+        self.authenticated = authenticated;
+    }
+
+    /// Whether this peer is authenticated. Test-only: production code only ever
+    /// SETS this; the enforcement (skipping the pieces cap) lives in
+    /// `on_request`.
+    #[cfg(test)]
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.authenticated
     }
 
     // ── Initial messages ──────────────────────────────────────────────────
@@ -400,8 +436,14 @@ impl TunnelCarrierPeer {
         // real overloaded seeder stops serving rather than serving forever.
         // A legitimate client authenticates almost immediately and never
         // comes close to this cap.
+        //
+        // This is a PRE-AUTH DoS bound only. An AUTHENTICATED carrier runs an
+        // ongoing piece-cover cadence (`client_mux.rs`) for the whole session;
+        // self-choking it mid-session would kill that cadence — a tell, and it
+        // defeats the cover — so the cap is skipped once authenticated. The
+        // pre-auth bound is untouched for unpromoted peers.
         self.pieces_served += 1;
-        if self.pieces_served >= super::config::MAX_SEEDER_PIECES_PER_CONN {
+        if !self.authenticated && self.pieces_served >= super::config::MAX_SEEDER_PIECES_PER_CONN {
             self.local_choked = true;
             actions.push(CarrierAction::OutgoingMessage(CoverMessage::Choke));
         }
@@ -1064,6 +1106,82 @@ mod tests {
         assert!(
             saw_choke,
             "the request that reaches the pieces cap must emit an explicit Choke"
+        );
+    }
+
+    // ── Authenticated carriers are exempt from the pre-auth pieces cap ─────
+    // (Plan C Task 3)
+
+    /// An AUTHENTICATED carrier runs an ongoing piece-cover cadence for the
+    /// whole session, so it must keep serving `Piece`s WELL past
+    /// `MAX_SEEDER_PIECES_PER_CONN` and must NEVER self-choke — a mid-session
+    /// `Choke` would kill the cadence (a tell). Serve twice the cap and prove
+    /// every request is answered with a `Piece`, no `Choke` is ever emitted, and
+    /// the peer stays unchoked.
+    #[tokio::test]
+    async fn authenticated_peer_serves_past_pieces_cap_without_choking() {
+        use super::super::config::MAX_SEEDER_PIECES_PER_CONN;
+
+        let (mut peer, _dir) = test_peer().await; // starts unchoked
+        peer.set_authenticated(true);
+        assert!(peer.is_authenticated());
+
+        for n in 0..(2 * MAX_SEEDER_PIECES_PER_CONN) {
+            let actions = peer
+                .on_message(Message::Request(Request::new(0, 0, 16384)))
+                .await
+                .unwrap();
+            let has_piece = actions.iter().any(|a| {
+                matches!(
+                    a,
+                    CarrierAction::OutgoingMessage(CoverMessage::Piece { .. })
+                )
+            });
+            assert!(
+                has_piece,
+                "authenticated request {n} (past the pre-auth cap) must still be served"
+            );
+            let has_choke = actions
+                .iter()
+                .any(|a| matches!(a, CarrierAction::OutgoingMessage(CoverMessage::Choke)));
+            assert!(
+                !has_choke,
+                "an authenticated carrier must NEVER self-choke (request {n})"
+            );
+        }
+
+        assert!(
+            !peer.is_local_choked(),
+            "an authenticated carrier must stay unchoked past the pre-auth pieces cap"
+        );
+    }
+
+    /// The flip side, so the exemption is not "always exempt": an UNauthenticated
+    /// peer still self-chokes exactly at `MAX_SEEDER_PIECES_PER_CONN` (Plan B's
+    /// pre-auth bound stays enforced).
+    #[tokio::test]
+    async fn unauthenticated_peer_still_self_chokes_at_pieces_cap() {
+        use super::super::config::MAX_SEEDER_PIECES_PER_CONN;
+
+        let (mut peer, _dir) = test_peer().await; // starts unchoked, NOT authenticated
+        assert!(!peer.is_authenticated());
+
+        for _ in 0..MAX_SEEDER_PIECES_PER_CONN {
+            peer.on_message(Message::Request(Request::new(0, 0, 16384)))
+                .await
+                .unwrap();
+        }
+        assert!(
+            peer.is_local_choked(),
+            "an unauthenticated peer must still self-choke at the pre-auth pieces cap"
+        );
+        let actions = peer
+            .on_message(Message::Request(Request::new(0, 0, 16384)))
+            .await
+            .unwrap();
+        assert!(
+            actions.is_empty(),
+            "an unauthenticated peer past the cap must not be served, got {actions:?}"
         );
     }
 
