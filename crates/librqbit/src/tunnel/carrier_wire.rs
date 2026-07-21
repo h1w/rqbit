@@ -285,6 +285,7 @@ mod tests {
             corpus_bytes: 512 * 1024,
             piece_length: 128 * 1024,
             display_name: "debian-12.iso".to_string(),
+            seed: [0u8; 32],
         };
         Arc::new(
             TunnelCarrierStore::open_or_initialize(&path, &config)

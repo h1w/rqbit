@@ -367,6 +367,7 @@ mod tests {
             corpus_bytes: TEST_CORPUS,
             piece_length: TEST_PIECE_LEN,
             display_name: "peer-test".into(),
+            seed: [0u8; 32],
         }
     }
     async fn test_store() -> (Arc<TunnelCarrierStore>, tempfile::TempDir) {

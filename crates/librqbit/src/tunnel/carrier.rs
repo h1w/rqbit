@@ -19,6 +19,9 @@ pub(crate) struct TunnelCarrierConfig {
     pub corpus_bytes: u64,
     pub piece_length: u32,
     pub display_name: String,
+    /// Deterministic seed for the corpus RNG. Both endpoints derive this from
+    /// the shared carrier hash so they generate byte-identical torrents.
+    pub seed: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,8 +309,8 @@ impl TunnelCarrierStore {
         let corpus_len = config.corpus_bytes as usize;
         let npieces = piece_count(config.corpus_bytes, config.piece_length);
 
-        // Generate random corpus
-        let mut rng = StdRng::from_os_rng();
+        // Deterministic corpus so both endpoints agree on the torrent.
+        let mut rng = StdRng::from_seed(config.seed);
         let mut corpus = vec![0u8; corpus_len];
         rng.fill(&mut corpus[..]);
 
@@ -421,6 +424,7 @@ mod tests {
             corpus_bytes: 65536,
             piece_length: 16384,
             display_name: "carrier-test".into(),
+            seed: [0u8; 32],
         }
     }
 
@@ -488,5 +492,46 @@ mod tests {
         };
         let result = TunnelCarrierStore::open_or_initialize(dir.path(), &bad_config).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn same_seed_produces_identical_descriptor_in_different_dirs() {
+        let mut cfg = test_config();
+        cfg.seed = [7u8; 32];
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = TunnelCarrierStore::open_or_initialize(dir_a.path(), &cfg)
+            .await
+            .unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = TunnelCarrierStore::open_or_initialize(dir_b.path(), &cfg)
+            .await
+            .unwrap();
+
+        assert_eq!(a.descriptor(), b.descriptor(), "same seed → same torrent");
+
+        let mut pa = vec![0u8; cfg.piece_length as usize];
+        let mut pb = vec![0u8; cfg.piece_length as usize];
+        a.read_piece(ValidPieceIndex(0), &mut pa).await.unwrap();
+        b.read_piece(ValidPieceIndex(0), &mut pb).await.unwrap();
+        assert_eq!(pa, pb, "same seed → identical piece bytes");
+    }
+
+    #[tokio::test]
+    async fn different_seed_produces_different_info_hash() {
+        let mut cfg1 = test_config();
+        cfg1.seed = [1u8; 32];
+        let mut cfg2 = test_config();
+        cfg2.seed = [2u8; 32];
+
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let s1 = TunnelCarrierStore::open_or_initialize(d1.path(), &cfg1)
+            .await
+            .unwrap();
+        let s2 = TunnelCarrierStore::open_or_initialize(d2.path(), &cfg2)
+            .await
+            .unwrap();
+        assert_ne!(s1.descriptor().info_hash, s2.descriptor().info_hash);
     }
 }
