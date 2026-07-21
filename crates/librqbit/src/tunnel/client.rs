@@ -7,16 +7,23 @@
 /// All destination traffic goes through the tunnel — the client never opens
 /// a direct connection to the requested destination.
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
+#[cfg(test)]
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::tunnel::carrier::TunnelCarrierStore;
+use crate::tunnel::carrier_peer::TunnelCarrierPeer;
+use crate::tunnel::carrier_wire::{CarrierReadHalf, CarrierWire, CarrierWriteHalf};
 use crate::tunnel::crypto::{self, NoiseTransport, TunnelCryptoError};
-use crate::tunnel::frame::{TunnelDestination, TunnelFrame, TunnelPrivateKey, TunnelPublicKey};
-use crate::tunnel::peer_wire_crypto::{EncryptedPeerIo, PeerWireCrypto};
-use crate::tunnel::server;
+#[cfg(test)]
+use crate::tunnel::frame::{TunnelDestination, TunnelFrame};
+use crate::tunnel::frame::{TunnelPrivateKey, TunnelPublicKey};
+use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
 
 // ── Client error ────────────────────────────────────────────────────────────
 
@@ -50,10 +57,22 @@ pub(crate) enum TunnelClientError {
 pub(crate) struct TunnelClient {
     /// Noise transport state for encrypt/decrypt of frames.
     transport: NoiseTransport,
-    /// Encrypted reader half.
-    reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-    /// Encrypted writer half.
-    writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    /// BitTorrent-masquerade carrier reader half.
+    read_half: CarrierReadHalf,
+    /// BitTorrent-masquerade carrier writer half.
+    write_half: CarrierWriteHalf,
+    /// Cover state machine (serves piece Request→Piece traffic).
+    carrier_peer: TunnelCarrierPeer,
+    /// Reassembles chunked Noise ciphertext from `rq_tunnel` messages. Only used
+    /// by the (test-only) blocking [`read_frame`](Self::read_frame); in
+    /// production the client is consumed by [`into_carrier`](Self::into_carrier)
+    /// immediately after connecting, so this field would otherwise be
+    /// write-only in production builds.
+    #[cfg(test)]
+    defrag: super::carrier_chunk::CarrierDefragmenter,
+    /// Decoded-but-not-yet-returned ciphertext blobs for the blocking reader.
+    #[cfg(test)]
+    pending: std::collections::VecDeque<Vec<u8>>,
     /// Next stream ID (even numbers for client-initiated).
     next_stream_id: AtomicU64,
     /// Next association ID.
@@ -64,51 +83,56 @@ pub(crate) struct TunnelClient {
 }
 
 impl TunnelClient {
-    /// Connect to the tunnel server and complete both handshake phases.
+    /// Connect to the tunnel server and complete both handshake phases over the
+    /// live BitTorrent masquerade carrier.
     pub async fn connect(
         server_addr: SocketAddr,
         identity_key: &TunnelPrivateKey,
         expected_server_key: &TunnelPublicKey,
         carrier_hash: librqbit_core::Id20,
+        carrier_store: Arc<TunnelCarrierStore>,
     ) -> Result<Self, TunnelClientError> {
         // ── Step 1: TCP connect ──────────────────────────────────────────
         let stream = TcpStream::connect(server_addr).await?;
 
-        // ── Step 2: PeerWireCrypto initiator handshake ───────────────────
-        let EncryptedPeerIo { reader, writer } = PeerWireCrypto::initiator(stream, carrier_hash)
+        // ── Step 2: MSE initiator ────────────────────────────────────────
+        let enc = PeerWireCrypto::initiator(stream, carrier_hash)
             .await
             .map_err(|e| TunnelClientError::CarrierHandshake(e.to_string()))?;
 
-        // ── Step 3: Noise IK initiator handshake ─────────────────────────
+        // ── Step 3: BT handshake + BEP-10 + cover ────────────────────────
+        let info_hash = carrier_store.descriptor().handshake_info_hash;
+        let wire = CarrierWire::establish(enc.reader, enc.writer, carrier_store, info_hash)
+            .await
+            .map_err(|e| TunnelClientError::CarrierHandshake(e.to_string()))?;
+        let (mut read_half, mut write_half, carrier_peer) = wire.into_halves();
+
+        // ── Step 4: Noise IK over rq_tunnel ──────────────────────────────
         let (handshake, noise_msg) = crypto::initiator_start(identity_key, expected_server_key)?;
-
-        // Write: 2-byte length-prefixed Noise initiator message
-        let mut writer = writer;
-        let msg_len = (noise_msg.len() as u16).to_be_bytes();
-        writer.write_all(&msg_len).await?;
-        writer.write_all(&noise_msg).await?;
-        writer.flush().await?;
-
-        // Read: 2-byte length-prefixed Noise responder reply
-        let mut reader = reader;
-        let mut len_buf = [0u8; 2];
-        reader.read_exact(&mut len_buf).await?;
-        let reply_len = u16::from_be_bytes(len_buf) as usize;
-        if reply_len > 256 {
-            return Err(TunnelCryptoError::HandshakeFailed(format!(
-                "noise reply too large: {reply_len}"
-            ))
-            .into());
+        for chunk in super::carrier_chunk::chunk_ciphertext(&noise_msg) {
+            write_half
+                .send_tunnel(&chunk)
+                .await
+                .map_err(|e| TunnelClientError::CarrierHandshake(e.to_string()))?;
         }
-        let mut reply_buf = vec![0u8; reply_len];
-        reader.read_exact(&mut reply_buf).await?;
 
-        let transport = crypto::initiator_complete(handshake, &reply_buf)?;
+        let mut defrag = super::carrier_chunk::CarrierDefragmenter::new(
+            super::carrier_chunk::MAX_CARRIER_CIPHERTEXT,
+        );
+        let reply = super::carrier_chunk::recv_one_ciphertext(&mut read_half, &mut defrag)
+            .await
+            .ok_or(TunnelClientError::ConnectionLost)?;
+        let transport = crypto::initiator_complete(handshake, &reply)?;
 
         Ok(Self {
             transport,
-            reader: Box::new(reader),
-            writer: Box::new(writer),
+            read_half,
+            write_half,
+            carrier_peer,
+            #[cfg(test)]
+            defrag,
+            #[cfg(test)]
+            pending: std::collections::VecDeque::new(),
             next_stream_id: AtomicU64::new(1),
             next_assoc_id: AtomicU64::new(1),
             #[cfg(test)]
@@ -116,6 +140,35 @@ impl TunnelClient {
         })
     }
 
+    // ── Accessors ────────────────────────────────────────────────────────
+
+    /// Consume the client into its Noise transport and BitTorrent-masquerade
+    /// carrier parts, for the multiplexer to drive shared reader/writer tasks.
+    pub(crate) fn into_carrier(
+        self,
+    ) -> (
+        NoiseTransport,
+        CarrierReadHalf,
+        CarrierWriteHalf,
+        TunnelCarrierPeer,
+    ) {
+        (
+            self.transport,
+            self.read_half,
+            self.write_half,
+            self.carrier_peer,
+        )
+    }
+}
+
+// ── Blocking single-connection API (test-only) ───────────────────────────────
+//
+// The production path connects, then immediately hands the client to
+// `ClientMux::new` via `into_carrier`. The direct request/response API below is
+// exercised only by the in-process tunnel fixtures, so it is gated behind
+// `#[cfg(test)]` — there is no dead non-test code carrying it.
+#[cfg(test)]
+impl TunnelClient {
     // ── Stream / association ID allocation ───────────────────────────────
 
     fn alloc_stream_id(&self) -> u64 {
@@ -219,57 +272,92 @@ impl TunnelClient {
         self.write_frame(&TunnelFrame::Ping { nonce }).await
     }
 
-    // ── Frame I/O ────────────────────────────────────────────────────────
+    // ── Frame I/O over the carrier ───────────────────────────────────────
 
-    /// Read the next encrypted frame from the server.
+    /// Read the next decrypted `TunnelFrame` from the server, serving piece
+    /// cover (Request→Piece) inline along the way. Reassembles chunked Noise
+    /// ciphertext from `rq_tunnel` messages via the persistent defragmenter.
     pub async fn read_frame(&mut self) -> Result<TunnelFrame, TunnelClientError> {
-        server::read_frame(&mut self.transport, &mut self.reader)
-            .await
-            .map_err(|e| match &e {
-                TunnelCryptoError::DecryptFailed(_) if e.to_string().contains("read len") => {
-                    TunnelClientError::ConnectionLost
+        use crate::tunnel::carrier_peer::CarrierAction;
+        use peer_binary_protocol::{Message, extended::ExtendedMessage};
+        loop {
+            if let Some(blob) = self.pending.pop_front() {
+                return self
+                    .transport
+                    .decrypt(&blob)
+                    .map_err(TunnelClientError::NoiseHandshake);
+            }
+            let msg = match self.read_half.recv_message().await {
+                Ok(Some(m)) => m,
+                Ok(None) | Err(_) => return Err(TunnelClientError::ConnectionLost),
+            };
+            match msg {
+                Message::Extended(ExtendedMessage::RqTunnel(rq)) => {
+                    match self.defrag.push(rq.as_bytes()) {
+                        Ok(blobs) => {
+                            for blob in blobs {
+                                self.pending.push_back(blob);
+                            }
+                        }
+                        Err(_) => return Err(TunnelClientError::ConnectionLost),
+                    }
                 }
-                _ => TunnelClientError::NoiseHandshake(e),
-            })
+                Message::KeepAlive => {}
+                other => match self.carrier_peer.on_message(other).await {
+                    Ok(actions) => {
+                        for a in actions {
+                            match a {
+                                CarrierAction::OutgoingMessage(m) => {
+                                    let _ = self.write_half.send_message(&m.to_message()).await;
+                                }
+                                CarrierAction::Disconnect(_) => {
+                                    return Err(TunnelClientError::ConnectionLost);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => return Err(TunnelClientError::ConnectionLost),
+                },
+            }
+        }
     }
 
-    /// Write a frame to the server (encrypted, length-prefixed).
+    /// Write a frame to the server: encrypt, chunk across `rq_tunnel` messages.
     pub async fn write_frame(&mut self, frame: &TunnelFrame) -> Result<(), TunnelClientError> {
-        server::write_frame(&mut self.transport, &mut self.writer, frame)
-            .await
-            .map_err(TunnelClientError::NoiseHandshake)
+        let blob = self
+            .transport
+            .encrypt(frame)
+            .map_err(TunnelClientError::NoiseHandshake)?;
+        for chunk in super::carrier_chunk::chunk_ciphertext(&blob) {
+            self.write_half
+                .send_tunnel(&chunk)
+                .await
+                .map_err(|e| TunnelClientError::CarrierHandshake(e.to_string()))?;
+        }
+        Ok(())
     }
 
-    // ── Accessors ────────────────────────────────────────────────────────
+    // ── Construction from handshake parts ─────────────────────────────────
 
-    /// Split the client into separate read and write halves.
+    /// Create a [`TunnelClient`] from already-completed carrier + Noise parts.
     ///
-    /// The caller must manage the `NoiseTransport` — both halves need it.
-    /// For most use cases, use [`read_frame`] and [`write_frame`] instead.
-    pub fn into_split(
-        self,
-    ) -> (
-        NoiseTransport,
-        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-    ) {
-        (self.transport, self.reader, self.writer)
-    }
-
-    /// Create a [`TunnelClient`] from already-completed handshake parts.
-    ///
-    /// For tests that run the MSE + Noise handshake outside of
+    /// For tests that run the MSE + BT + Noise handshake outside of
     /// [`TunnelClient::connect`].
-    #[cfg(test)]
-    pub(crate) fn from_raw_parts(
+    pub(crate) fn from_carrier_parts(
         transport: NoiseTransport,
-        reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-        writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        read_half: CarrierReadHalf,
+        write_half: CarrierWriteHalf,
+        carrier_peer: TunnelCarrierPeer,
     ) -> Self {
         Self {
             transport,
-            reader,
-            writer,
+            read_half,
+            write_half,
+            carrier_peer,
+            defrag: super::carrier_chunk::CarrierDefragmenter::new(
+                super::carrier_chunk::MAX_CARRIER_CIPHERTEXT,
+            ),
+            pending: std::collections::VecDeque::new(),
             next_stream_id: std::sync::atomic::AtomicU64::new(1),
             next_assoc_id: std::sync::atomic::AtomicU64::new(1),
             local_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -280,7 +368,6 @@ impl TunnelClient {
 
     /// Returns the number of local DNS resolver calls.
     /// Always 0 in production (the client never resolves).
-    #[cfg(test)]
     pub fn local_resolver_calls(&self) -> usize {
         self.local_resolver_calls.load(Ordering::Relaxed)
     }
@@ -296,96 +383,83 @@ mod tests {
     use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr};
 
-    /// Build a test client and server that are already connected via an
-    /// in-process pair of TCP streams (tokio duplex).
+    /// Build a test client and server already connected via an in-process
+    /// duplex, running the full BitTorrent-masquerade carrier + Noise handshake.
+    /// The server-side carrier halves are returned (unused by callers) so their
+    /// transport stays alive for the duration of the test.
     async fn test_tunnel_pair() -> (
         TunnelClient,
         NoiseTransport,
-        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        CarrierReadHalf,
+        CarrierWriteHalf,
     ) {
+        use crate::tunnel::carrier_chunk::{
+            CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+        };
+        use crate::tunnel::carrier_identity::build_carrier_store;
+
         let (client_key, client_pub) = generate_keypair();
         let (server_key, server_pub) = generate_keypair();
-
-        let client_pub_clone = client_pub.clone();
-
-        // In-process duplex for the initiator/responder
-        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
-
         let carrier_hash = Id20::new([0xAB; 20]);
 
-        // Spawn the server side
+        // Deterministic carrier store shared by both ends (same `info_hash`).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep();
+        let carrier_store = build_carrier_store(&path, &server_pub).await.unwrap();
+        let info_hash = carrier_store.descriptor().handshake_info_hash;
+
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let server_store = carrier_store.clone();
+        let client_pub_clone = client_pub.clone();
+
         let server_handle = tokio::spawn(async move {
-            let encrypted = PeerWireCrypto::responder(server_stream, carrier_hash)
+            let enc = PeerWireCrypto::responder(server_stream, carrier_hash)
                 .await
                 .unwrap();
+            let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
+                .await
+                .unwrap();
+            let (mut read_half, mut write_half, carrier_peer) = wire.into_halves();
 
-            let mut reader = encrypted.reader;
-            let mut writer = encrypted.writer;
-
-            // Read Noise initiator message
-            let mut len_buf = [0u8; 2];
-            use tokio::io::AsyncReadExt;
-            reader.read_exact(&mut len_buf).await.unwrap();
-            let msg_len = u16::from_be_bytes(len_buf) as usize;
-            let mut noise_msg = vec![0u8; msg_len];
-            reader.read_exact(&mut noise_msg).await.unwrap();
-
-            // Responder accept
+            let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+            let noise_msg = recv_one_ciphertext(&mut read_half, &mut defrag)
+                .await
+                .unwrap();
             let mut allowed = HashSet::new();
             allowed.insert(client_pub_clone);
-            let (transport, _client_key, reply) =
+            let (transport, _ck, reply) =
                 crypto::responder_accept(&server_key, &noise_msg, &allowed).unwrap();
-
-            // Send reply
-            let reply_len = (reply.len() as u16).to_be_bytes();
-            use tokio::io::AsyncWriteExt;
-            writer.write_all(&reply_len).await.unwrap();
-            writer.write_all(&reply).await.unwrap();
-            writer.flush().await.unwrap();
-
-            (
-                transport,
-                Box::new(reader) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-                Box::new(writer) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-            )
+            for chunk in chunk_ciphertext(&reply) {
+                write_half.send_tunnel(&chunk).await.unwrap();
+            }
+            (transport, read_half, write_half, carrier_peer)
         });
 
-        // Client side: connect through the duplex
-        let encrypted = PeerWireCrypto::initiator(client_stream, carrier_hash)
+        // Client side: MSE + BT + Noise over the carrier.
+        let enc = PeerWireCrypto::initiator(client_stream, carrier_hash)
             .await
             .unwrap();
+        let wire = CarrierWire::establish(enc.reader, enc.writer, carrier_store, info_hash)
+            .await
+            .unwrap();
+        let (mut read_half, mut write_half, carrier_peer) = wire.into_halves();
 
         let (handshake, noise_msg) = crypto::initiator_start(&client_key, &server_pub).unwrap();
+        for chunk in chunk_ciphertext(&noise_msg) {
+            write_half.send_tunnel(&chunk).await.unwrap();
+        }
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let reply = recv_one_ciphertext(&mut read_half, &mut defrag)
+            .await
+            .unwrap();
+        let transport = crypto::initiator_complete(handshake, &reply).unwrap();
 
-        let mut reader = encrypted.reader;
-        let mut writer = encrypted.writer;
+        let (server_transport, server_read, server_write, _server_peer) =
+            server_handle.await.unwrap();
 
-        let msg_len = (noise_msg.len() as u16).to_be_bytes();
-        writer.write_all(&msg_len).await.unwrap();
-        writer.write_all(&noise_msg).await.unwrap();
-        writer.flush().await.unwrap();
-
-        let mut len_buf = [0u8; 2];
-        reader.read_exact(&mut len_buf).await.unwrap();
-        let reply_len = u16::from_be_bytes(len_buf) as usize;
-        let mut reply_buf = vec![0u8; reply_len];
-        reader.read_exact(&mut reply_buf).await.unwrap();
-
-        let transport = crypto::initiator_complete(handshake, &reply_buf).unwrap();
-
-        let (_server_transport, server_reader, server_writer) = server_handle.await.unwrap();
-
-        let client = TunnelClient {
-            transport,
-            reader: Box::new(reader),
-            writer: Box::new(writer),
-            next_stream_id: AtomicU64::new(1),
-            next_assoc_id: AtomicU64::new(1),
-            local_resolver_calls: std::sync::atomic::AtomicUsize::new(0),
-        };
-
-        (client, _server_transport, server_reader, server_writer)
+        let client =
+            TunnelClient::from_carrier_parts(transport, read_half, write_half, carrier_peer);
+        (client, server_transport, server_read, server_write)
     }
 
     #[tokio::test]

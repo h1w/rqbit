@@ -30,17 +30,84 @@ pub(crate) enum TunnelCarrierError {
     Store(#[from] anyhow::Error),
 }
 
+// ── Cover message (owned) ────────────────────────────────────────────────────
+
+/// An OWNED cover-traffic peer message.
+///
+/// The carrier serves plausible BitTorrent cover (Bitfield/Piece/…) on the LIVE
+/// path — on every inbound `Request`, and during the pre-Noise early-cover loop
+/// in [`CarrierWire::establish`]. Carrying a borrowed `Message<'static>` there
+/// forced a permanent heap leak to synthesize the `'static` lifetime,
+/// leaking the block bytes on every request (an unbounded, amplifiable leak).
+///
+/// Instead we carry this owned value across the action/cover channels and turn
+/// it into a borrowed [`Message<'_>`] only at the serialize site via
+/// [`CoverMessage::to_message`] — no leaked `'static` bytes.
+#[derive(Debug)]
+pub(crate) enum CoverMessage {
+    Bitfield(bytes::Bytes),
+    Unchoke,
+    Interested,
+    Choke,
+    NotInterested,
+    Have(u32),
+    Request {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: u32,
+        begin: u32,
+        data: bytes::Bytes,
+    },
+    KeepAlive,
+}
+
+impl CoverMessage {
+    /// Borrow this owned cover message as a wire [`Message`] for serialization.
+    pub(crate) fn to_message(&self) -> peer_binary_protocol::Message<'_> {
+        use buffers::ByteBuf;
+        use peer_binary_protocol::{Message, Piece, Request};
+        match self {
+            CoverMessage::Bitfield(b) => Message::Bitfield(ByteBuf(b)),
+            CoverMessage::Unchoke => Message::Unchoke,
+            CoverMessage::Interested => Message::Interested,
+            CoverMessage::Choke => Message::Choke,
+            CoverMessage::NotInterested => Message::NotInterested,
+            CoverMessage::Have(i) => Message::Have(*i),
+            CoverMessage::Request {
+                index,
+                begin,
+                length,
+            } => Message::Request(Request::new(*index, *begin, *length)),
+            CoverMessage::Piece { index, begin, data } => {
+                Message::Piece(Piece::from_data(*index, *begin, data))
+            }
+            CoverMessage::KeepAlive => Message::KeepAlive,
+        }
+    }
+}
+
 // ── Action Type ──────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub(crate) enum CarrierAction {
-    OutgoingMessage(Message<'static>),
+    OutgoingMessage(CoverMessage),
+    // Reserved for a future graceful-disconnect signal distinct from a hard
+    // protocol error (every `on_message` violation currently surfaces as an
+    // `Err(TunnelCarrierError)`, which callers already treat as terminal); no
+    // handler constructs this yet.
+    #[allow(dead_code)]
     Disconnect(String),
 }
 
 // ── Cached Piece-Layer Metadata ──────────────────────────────────────────────
 
 struct CarrierPieceLayer {
+    // Retained for future diagnostics (e.g. logging the root on a validation
+    // failure); only used as a local lookup key during construction today.
+    #[allow(dead_code)]
     pieces_root: Id32,
     leaf_hashes: Vec<Id32>,
     piece_length: u32,
@@ -104,47 +171,6 @@ impl CarrierPieceLayer {
     fn npieces(&self) -> usize {
         self.leaf_hashes.len()
     }
-
-    fn verify_block(
-        &self,
-        piece_index: u32,
-        begin: u32,
-        block: &[u8],
-    ) -> Result<(), TunnelCarrierError> {
-        let idx = piece_index as usize;
-        let block_len = block.len() as u32;
-
-        if idx >= self.npieces() {
-            return Err(TunnelCarrierError::InvalidRequest {
-                reason: format!(
-                    "piece index {piece_index} out of range (max {})",
-                    self.npieces().saturating_sub(1),
-                ),
-            });
-        }
-
-        if begin + block_len > self.piece_length {
-            return Err(TunnelCarrierError::InvalidRequest {
-                reason: format!(
-                    "block overflow: begin={begin} + length={block_len} > piece_length={}",
-                    self.piece_length,
-                ),
-            });
-        }
-
-        let leaf_hash = sha256_hash(block);
-
-        let expected = &self.leaf_hashes[idx];
-        if leaf_hash != *expected {
-            return Err(TunnelCarrierError::PieceHashMismatch {
-                index: piece_index,
-                expected: hex::encode(expected.0),
-                actual: hex::encode(leaf_hash.0),
-            });
-        }
-
-        Ok(())
-    }
 }
 
 // ── Carrier Peer ─────────────────────────────────────────────────────────────
@@ -152,6 +178,9 @@ impl CarrierPieceLayer {
 pub(crate) struct TunnelCarrierPeer {
     carrier: Arc<TunnelCarrierStore>,
     remote_have: BitBox<u8, Msb0>,
+    // Reserved for choking the remote from our side; no handler flips this
+    // yet (only `remote_choked`, tracking the peer's Choke/Unchoke, is read).
+    #[allow(dead_code)]
     local_choked: bool,
     remote_choked: bool,
     layer: CarrierPieceLayer,
@@ -171,7 +200,7 @@ impl TunnelCarrierPeer {
 
     // ── Initial messages ──────────────────────────────────────────────────
 
-    pub fn initial_messages(&self) -> Vec<Message<'static>> {
+    pub fn initial_messages(&self) -> Vec<CoverMessage> {
         let have = self.carrier.have_bitfield();
         let bitfield_bytes = have.len().div_ceil(8);
         let mut buf = vec![0u8; bitfield_bytes];
@@ -185,8 +214,10 @@ impl TunnelCarrierPeer {
             }
         }
 
-        let leaked: &'static [u8] = Box::leak(buf.into_boxed_slice());
-        vec![Message::Bitfield(ByteBuf(leaked)), Message::Unchoke]
+        vec![
+            CoverMessage::Bitfield(bytes::Bytes::from(buf)),
+            CoverMessage::Unchoke,
+        ]
     }
 
     // ── Message dispatch ──────────────────────────────────────────────────
@@ -197,7 +228,7 @@ impl TunnelCarrierPeer {
     ) -> Result<Vec<CarrierAction>, TunnelCarrierError> {
         match message {
             Message::Request(req) => self.on_request(req).await,
-            Message::Piece(piece) => self.on_piece(piece),
+            Message::Piece(piece) => self.on_piece(piece).await,
             Message::Bitfield(bf) => self.on_bitfield(bf),
             Message::Have(index) => Ok(self.on_have(index)),
             Message::Choke => Ok(self.on_choke()),
@@ -263,13 +294,16 @@ impl TunnelCarrierPeer {
             });
         };
 
-        let leaked: &'static [u8] = Box::leak(block.to_vec().into_boxed_slice());
-        let piece_msg = Message::Piece(Piece::from_data(idx, begin, leaked));
+        let piece_msg = CoverMessage::Piece {
+            index: idx,
+            begin,
+            data: bytes::Bytes::copy_from_slice(block),
+        };
 
         Ok(vec![CarrierAction::OutgoingMessage(piece_msg)])
     }
 
-    fn on_piece(
+    async fn on_piece(
         &mut self,
         piece: Piece<ByteBuf<'_>>,
     ) -> Result<Vec<CarrierAction>, TunnelCarrierError> {
@@ -277,13 +311,13 @@ impl TunnelCarrierPeer {
 
         // Validate block_0
         if !block_0.is_empty() {
-            self.layer.verify_block(piece.index, piece.begin, block_0)?;
+            self.verify_block(piece.index, piece.begin, block_0).await?;
         }
 
         // Validate block_1
         if !block_1.is_empty() {
-            self.layer
-                .verify_block(piece.index, piece.begin + block_0.len() as u32, block_1)?;
+            self.verify_block(piece.index, piece.begin + block_0.len() as u32, block_1)
+                .await?;
         }
 
         // Mark piece as available on the remote
@@ -292,6 +326,80 @@ impl TunnelCarrierPeer {
         }
 
         Ok(vec![])
+    }
+
+    /// Verify an incoming piece BLOCK against the local copy of the carrier
+    /// corpus. The carrier is a synthetic torrent both endpoints generate (or
+    /// open) deterministically from the same seed, so a received block can be
+    /// checked directly against the corresponding byte range of the local
+    /// piece.
+    ///
+    /// This is deliberately NOT a lookup against `self.layer.leaf_hashes`: the
+    /// piece layer's hashes each cover a WHOLE `piece_length`-sized piece
+    /// (see `carrier.rs::hash_piece`), while real BT peers — and the minimal
+    /// piece cover wired into `ClientMux::new` — request/respond in
+    /// individual blocks well below `piece_length` (bounded by `MAX_MSG_LEN`).
+    /// Hashing a partial block and comparing it to a whole-piece hash would
+    /// always mismatch whenever `piece_length` exceeds one block, which is
+    /// the normal case (`CARRIER_PIECE_LENGTH` is 256 KiB).
+    async fn verify_block(
+        &self,
+        piece_index: u32,
+        begin: u32,
+        block: &[u8],
+    ) -> Result<(), TunnelCarrierError> {
+        let idx = piece_index as usize;
+
+        if idx >= self.layer.npieces() {
+            return Err(TunnelCarrierError::InvalidRequest {
+                reason: format!(
+                    "piece index {piece_index} out of range (max {})",
+                    self.layer.npieces().saturating_sub(1),
+                ),
+            });
+        }
+
+        // Compute the end of the block range in `usize` via checked arithmetic
+        // so an attacker-controlled `begin` near `u32::MAX` cannot wrap the
+        // bounds check (as plain u32 addition would) and then panic on the
+        // out-of-range slice below.
+        let begin_usize = begin as usize;
+        let end = begin_usize.checked_add(block.len()).ok_or_else(|| {
+            TunnelCarrierError::InvalidRequest {
+                reason: format!(
+                    "block overflow: begin={begin} + length={} overflows usize",
+                    block.len(),
+                ),
+            }
+        })?;
+
+        if end > self.layer.piece_length as usize {
+            return Err(TunnelCarrierError::InvalidRequest {
+                reason: format!(
+                    "block overflow: begin={begin} + length={} > piece_length={}",
+                    block.len(),
+                    self.layer.piece_length,
+                ),
+            });
+        }
+
+        let piece_len = self.layer.piece_length as usize;
+        let mut local = vec![0u8; piece_len];
+        self.carrier
+            .read_piece(ValidPieceIndex(piece_index), &mut local)
+            .await
+            .map_err(TunnelCarrierError::Store)?;
+
+        let expected = &local[begin_usize..end];
+        if expected != block {
+            return Err(TunnelCarrierError::PieceHashMismatch {
+                index: piece_index,
+                expected: hex::encode(sha256_hash(expected).0),
+                actual: hex::encode(sha256_hash(block).0),
+            });
+        }
+
+        Ok(())
     }
 
     fn on_bitfield(&mut self, bf: ByteBuf<'_>) -> Result<Vec<CarrierAction>, TunnelCarrierError> {
@@ -367,6 +475,7 @@ mod tests {
             corpus_bytes: TEST_CORPUS,
             piece_length: TEST_PIECE_LEN,
             display_name: "peer-test".into(),
+            seed: [0u8; 32],
         }
     }
     async fn test_store() -> (Arc<TunnelCarrierStore>, tempfile::TempDir) {
@@ -393,7 +502,7 @@ mod tests {
 
         // First message should be Bitfield
         let bitfield = match &msgs[0] {
-            Message::Bitfield(bf) => bf.as_ref(),
+            CoverMessage::Bitfield(bf) => bf.as_ref(),
             other => panic!("expected Bitfield, got {other:?}"),
         };
 
@@ -409,7 +518,7 @@ mod tests {
         );
 
         // Second message should be Unchoke
-        assert!(matches!(msgs[1], Message::Unchoke), "expected Unchoke");
+        assert!(matches!(msgs[1], CoverMessage::Unchoke), "expected Unchoke");
     }
 
     // ── Request handling ──────────────────────────────────────────────────
@@ -425,13 +534,11 @@ mod tests {
 
         assert_eq!(actions.len(), 1, "expected one Piece action");
         match &actions[0] {
-            CarrierAction::OutgoingMessage(Message::Piece(piece)) => {
-                assert_eq!(piece.index, 0);
-                assert_eq!(piece.begin, 0);
+            CarrierAction::OutgoingMessage(CoverMessage::Piece { index, begin, data }) => {
+                assert_eq!(*index, 0);
+                assert_eq!(*begin, 0);
                 // Full 16KiB piece
-                let (b0, b1) = piece.data();
-                let total = b0.len() + b1.len();
-                assert_eq!(total, 16384, "expected 16384-byte piece");
+                assert_eq!(data.len(), 16384, "expected 16384-byte piece");
             }
             other => panic!("expected Piece, got {other:?}"),
         }
@@ -575,6 +682,19 @@ mod tests {
         assert!(
             matches!(result, Err(TunnelCarrierError::InvalidRequest { .. })),
             "expected InvalidRequest for out-of-range piece, got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_piece_with_overflowing_begin_without_panicking() {
+        let (mut peer, _dir) = test_peer().await;
+        let block = [0u8; 16];
+        let result = peer
+            .on_message(Message::Piece(Piece::from_data(0, u32::MAX - 4, &block)))
+            .await;
+        assert!(
+            matches!(result, Err(TunnelCarrierError::InvalidRequest { .. })),
+            "expected InvalidRequest, got {result:?}",
         );
     }
 

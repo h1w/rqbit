@@ -155,6 +155,11 @@ async fn udp_associate_echoes_datagram_through_tunnel() {
 
 #[tokio::test]
 async fn client_rejects_wrong_server_key_before_sending_frames() {
+    use crate::tunnel::carrier_chunk::{
+        CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+    };
+    use crate::tunnel::carrier_identity::build_carrier_store;
+    use crate::tunnel::carrier_wire::CarrierWire;
     use crate::tunnel::client::TunnelClient;
     use crate::tunnel::crypto::generate_keypair;
     use librqbit_core::Id20;
@@ -162,8 +167,8 @@ async fn client_rejects_wrong_server_key_before_sending_frames() {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     // Start a server with a keypair. The client will pin a DIFFERENT key.
-    let (server_sk, _server_pk) = generate_keypair();
-    let (client_sk, _client_pk) = generate_keypair();
+    let (server_sk, server_pk) = generate_keypair();
+    let (client_sk, client_pk) = generate_keypair();
     let (_, wrong_server_pk) = generate_keypair();
 
     let listener = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
@@ -171,47 +176,60 @@ async fn client_rejects_wrong_server_key_before_sending_frames() {
         .expect("bind");
     let server_addr = listener.local_addr().unwrap();
 
-    // Spawn an accept task that does the PWC+Noise handshake with the real server key.
+    // Shared carrier store built from the REAL server key, so the carrier
+    // (BT-masquerade) handshake succeeds on both ends and the wrong pinned key
+    // is caught at the NOISE stage — the point of this test.
+    let dir = tempfile::tempdir().unwrap();
+    let store = build_carrier_store(&dir.keep(), &server_pk).await.unwrap();
+    let info_hash = store.descriptor().handshake_info_hash;
+    let server_store = store.clone();
     let server_sk_clone = server_sk.clone();
+    let client_pk_c = client_pk.clone();
+
+    // Spawn an accept task that runs the carrier + Noise handshake with the real
+    // server key.
     let accept_handle = tokio::spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await {
-            let carrier_hash = Id20::new([0xAB; 20]);
-            let encrypted =
-                crate::tunnel::peer_wire_crypto::PeerWireCrypto::responder(stream, carrier_hash)
-                    .await;
-            if let Ok(mut e) = encrypted {
-                use tokio::io::AsyncReadExt;
-                // Read Noise initiator message
-                let mut len_buf = [0u8; 2];
-                if e.reader.read_exact(&mut len_buf).await.is_err() {
-                    return;
-                }
-                let msg_len = u16::from_be_bytes(len_buf) as usize;
-                let mut noise_msg = vec![0u8; msg_len];
-                if e.reader.read_exact(&mut noise_msg).await.is_err() {
-                    return;
-                }
-                // Accept with real server key (this will succeed at Noise level
-                // but the client has wrong_server_pk pinned)
-                let mut allowed = HashSet::new();
-                allowed.insert(_client_pk);
-                let result =
-                    crate::tunnel::crypto::responder_accept(&server_sk_clone, &noise_msg, &allowed);
-                // Send reply or close — either way, client should detect mismatch
-                if let Ok((_transport, _ck, reply)) = result {
-                    use tokio::io::AsyncWriteExt;
-                    let reply_len = u16::try_from(reply.len()).unwrap().to_be_bytes();
-                    let _ = e.writer.write_all(&reply_len).await;
-                    let _ = e.writer.write_all(&reply).await;
-                    let _ = e.writer.flush().await;
-                }
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let carrier_hash = Id20::new([0xAB; 20]);
+        let Ok(enc) =
+            crate::tunnel::peer_wire_crypto::PeerWireCrypto::responder(stream, carrier_hash).await
+        else {
+            return;
+        };
+        let Ok(wire) =
+            CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash).await
+        else {
+            return;
+        };
+        let (mut read_half, mut write_half, _peer) = wire.into_halves();
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let Some(noise_msg) = recv_one_ciphertext(&mut read_half, &mut defrag).await else {
+            return;
+        };
+        // Accept with real server key (succeeds at Noise level, but the client
+        // has wrong_server_pk pinned and will reject the reply).
+        let mut allowed = HashSet::new();
+        allowed.insert(client_pk_c);
+        if let Ok((_transport, _ck, reply)) =
+            crate::tunnel::crypto::responder_accept(&server_sk_clone, &noise_msg, &allowed)
+        {
+            for chunk in chunk_ciphertext(&reply) {
+                let _ = write_half.send_tunnel(&chunk).await;
             }
         }
     });
 
     let carrier_hash = Id20::new([0xAB; 20]);
-    let result =
-        TunnelClient::connect(server_addr, &client_sk, &wrong_server_pk, carrier_hash).await;
+    let result = TunnelClient::connect(
+        server_addr,
+        &client_sk,
+        &wrong_server_pk,
+        carrier_hash,
+        store,
+    )
+    .await;
 
     assert!(
         result.is_err(),
@@ -233,7 +251,6 @@ async fn server_rejects_unknown_client_key_during_noise_handshake() {
     use librqbit_core::Id20;
     use std::collections::HashSet;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::path::PathBuf;
 
     let (server_sk, server_pk) = generate_keypair();
     let (_known_client_sk, known_client_pk) = generate_keypair();
@@ -246,15 +263,33 @@ async fn server_rejects_unknown_client_key_during_noise_handshake() {
 
     let mut allowed = HashSet::new();
     allowed.insert(known_client_pk);
+    // Fresh temp dir per run (not a fixed shared `/tmp` path): `server_sk` is
+    // freshly random per test run, and the deterministic carrier store's
+    // content depends on it, so a fixed path reused across process runs
+    // would race/fail reopen validation against a stale descriptor.
+    let carrier_dir = tempfile::tempdir().expect("carrier temp dir");
     let opts = TunnelServerOptions {
         peer_listen: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         identity_key: server_sk,
         allowed_client_keys: allowed,
         egress_policy: EgressPolicy::default(),
-        carrier_root: PathBuf::from("/tmp/test-carrier-reject"),
+        carrier_root: carrier_dir.path().to_path_buf(),
     };
 
-    let server = TunnelServer::new(opts);
+    let carrier_store =
+        crate::tunnel::carrier_identity::build_carrier_store(&opts.carrier_root, &server_pk)
+            .await
+            .expect("build carrier store");
+    let server = TunnelServer::new(opts, carrier_store);
+
+    // The client builds its own store from the (correct) pinned server key, so
+    // the carrier handshake succeeds and the unknown client key is caught at the
+    // Noise stage.
+    let client_carrier_dir = tempfile::tempdir().expect("client carrier temp dir");
+    let client_carrier_store =
+        crate::tunnel::carrier_identity::build_carrier_store(client_carrier_dir.path(), &server_pk)
+            .await
+            .expect("build client carrier store");
 
     let server_clone = server.clone();
     let accept_handle = tokio::spawn(async move {
@@ -268,8 +303,14 @@ async fn server_rejects_unknown_client_key_during_noise_handshake() {
     });
 
     let carrier_hash = Id20::new([0xAB; 20]);
-    let connect_result =
-        TunnelClient::connect(listen_addr, &unknown_client_sk, &server_pk, carrier_hash).await;
+    let connect_result = TunnelClient::connect(
+        listen_addr,
+        &unknown_client_sk,
+        &server_pk,
+        carrier_hash,
+        client_carrier_store,
+    )
+    .await;
 
     let admission_result = accept_handle.await.expect("accept handle join");
     assert!(
@@ -575,6 +616,12 @@ async fn client_tunnel_starts_when_server_unreachable() {
                 expected_server_key: server_pk,
                 pairing: None,
                 carriers: crate::tunnel::config::DEFAULT_CARRIERS,
+                // Dedicated dir (not the shared `TunnelClientOptions::default()`
+                // path): `server_pk` above is freshly random per test run, and
+                // the deterministic carrier store's content depends on it, so
+                // reusing the fixed default path across test runs/processes
+                // would race and fail reopen validation.
+                carrier_root: dir.path().join("client-carrier"),
             })),
             ..Default::default()
         },
@@ -596,70 +643,82 @@ async fn build_real_relay_pair() -> (
     crate::tunnel::client::TunnelClient,
     crate::tunnel::server::AdmittedPeer,
 ) {
+    use crate::tunnel::carrier_chunk::{
+        CarrierDefragmenter, MAX_CARRIER_CIPHERTEXT, chunk_ciphertext, recv_one_ciphertext,
+    };
+    use crate::tunnel::carrier_identity::build_carrier_store;
+    use crate::tunnel::carrier_wire::CarrierWire;
     use crate::tunnel::client::TunnelClient;
     use crate::tunnel::crypto::{self, generate_keypair};
     use crate::tunnel::peer_wire_crypto::PeerWireCrypto;
     use crate::tunnel::server::AdmittedPeer;
     use librqbit_core::Id20;
     use std::collections::HashSet;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (client_sk, client_pk) = generate_keypair();
     let (server_sk, server_pk) = generate_keypair();
     let carrier_hash = Id20::new([0xAB; 20]);
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (client_io, server_io) = tokio::io::duplex(256 * 1024);
     let client_pk_c = client_pk.clone();
+
+    // Deterministic carrier store shared by both ends (same `info_hash`). The
+    // temp dir is leaked (`.keep()`) so the store outlives this helper; these
+    // tests never read pieces from disk (no BT Request messages flow).
+    let dir = tempfile::tempdir().unwrap();
+    let carrier_store = build_carrier_store(&dir.keep(), &server_pk).await.unwrap();
+    let info_hash = carrier_store.descriptor().handshake_info_hash;
+    let server_store = carrier_store.clone();
 
     let server_handle = tokio::spawn(async move {
         let enc = PeerWireCrypto::responder(server_io, carrier_hash)
             .await
             .unwrap();
-        let mut reader = enc.reader;
-        let mut writer = enc.writer;
-        let mut len_buf = [0u8; 2];
-        reader.read_exact(&mut len_buf).await.unwrap();
-        let msg_len = u16::from_be_bytes(len_buf) as usize;
-        let mut noise_msg = vec![0u8; msg_len];
-        reader.read_exact(&mut noise_msg).await.unwrap();
+        let wire = CarrierWire::establish(enc.reader, enc.writer, server_store, info_hash)
+            .await
+            .unwrap();
+        let (mut read_half, mut write_half, carrier_peer) = wire.into_halves();
+
+        let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+        let noise_msg = recv_one_ciphertext(&mut read_half, &mut defrag)
+            .await
+            .unwrap();
         let mut allowed = HashSet::new();
         allowed.insert(client_pk_c);
         let (transport, client_key, reply) =
             crypto::responder_accept(&server_sk, &noise_msg, &allowed).unwrap();
-        let reply_len = u16::try_from(reply.len()).unwrap().to_be_bytes();
-        writer.write_all(&reply_len).await.unwrap();
-        writer.write_all(&reply).await.unwrap();
-        writer.flush().await.unwrap();
+        for chunk in chunk_ciphertext(&reply) {
+            write_half.send_tunnel(&chunk).await.unwrap();
+        }
         AdmittedPeer {
             client_key,
             transport,
-            reader,
-            writer,
+            read_half,
+            write_half,
+            carrier_peer,
         }
     });
 
     let enc = PeerWireCrypto::initiator(client_io, carrier_hash)
         .await
         .unwrap();
-    let mut client_reader = enc.reader;
-    let mut client_writer = enc.writer;
+    let wire = CarrierWire::establish(enc.reader, enc.writer, carrier_store, info_hash)
+        .await
+        .unwrap();
+    let (mut read_half, mut write_half, carrier_peer) = wire.into_halves();
+
     let (handshake, noise_msg) = crypto::initiator_start(&client_sk, &server_pk).unwrap();
-    let msg_len = u16::try_from(noise_msg.len()).unwrap().to_be_bytes();
-    client_writer.write_all(&msg_len).await.unwrap();
-    client_writer.write_all(&noise_msg).await.unwrap();
-    client_writer.flush().await.unwrap();
-    let mut len_buf = [0u8; 2];
-    client_reader.read_exact(&mut len_buf).await.unwrap();
-    let reply_len = u16::from_be_bytes(len_buf) as usize;
-    let mut reply_buf = vec![0u8; reply_len];
-    client_reader.read_exact(&mut reply_buf).await.unwrap();
-    let client_transport = crypto::initiator_complete(handshake, &reply_buf).unwrap();
+    for chunk in chunk_ciphertext(&noise_msg) {
+        write_half.send_tunnel(&chunk).await.unwrap();
+    }
+    let mut defrag = CarrierDefragmenter::new(MAX_CARRIER_CIPHERTEXT);
+    let reply = recv_one_ciphertext(&mut read_half, &mut defrag)
+        .await
+        .unwrap();
+    let client_transport = crypto::initiator_complete(handshake, &reply).unwrap();
 
     let peer = server_handle.await.unwrap();
-    let client = TunnelClient::from_raw_parts(
-        client_transport,
-        Box::new(client_reader),
-        Box::new(client_writer),
-    );
+    let client =
+        TunnelClient::from_carrier_parts(client_transport, read_half, write_half, carrier_peer);
     (client, peer)
 }
 
@@ -1205,6 +1264,7 @@ async fn start_live_carrier_pool(
 
     let mut allowed_client_keys = HashSet::new();
     allowed_client_keys.insert(client_pk);
+    let server_carrier_root = carrier_dir.path().join("server");
     let server_opts = TunnelServerOptions {
         peer_listen: server_addr,
         identity_key: server_sk,
@@ -1213,9 +1273,13 @@ async fn start_live_carrier_pool(
             allow_loopback: true,
             ..Default::default()
         },
-        carrier_root: carrier_dir.path().to_path_buf(),
+        carrier_root: server_carrier_root.clone(),
     };
-    let server = TunnelServer::new(server_opts);
+    let server_carrier_store =
+        crate::tunnel::carrier_identity::build_carrier_store(&server_carrier_root, &server_pk)
+            .await
+            .expect("build server carrier store");
+    let server = TunnelServer::new(server_opts, server_carrier_store);
     let server_shutdown = CancellationToken::new();
     let server_for_run = server.clone();
     let run_shutdown = server_shutdown.clone();
@@ -1245,8 +1309,17 @@ async fn start_live_carrier_pool(
         expected_server_key: server_pk,
         pairing: None,
         carriers,
+        // Dedicated subdir of the same temp root as the server (NOT the
+        // shared `TunnelClientOptions::default()` path): each invocation of
+        // this helper uses a fresh random `server_pk`, and the deterministic
+        // carrier store's content depends on it, so sharing a fixed path
+        // across concurrently-running tests would race and fail reopen
+        // validation.
+        carrier_root: carrier_dir.path().join("client"),
     };
-    let pool = CarrierPool::start(client_opts, None, client_shutdown.clone());
+    let pool = CarrierPool::start(client_opts, None, client_shutdown.clone())
+        .await
+        .expect("build client carrier pool");
 
     (
         pool,
@@ -1395,5 +1468,142 @@ async fn carrier_pool_reflects_full_carrier_loss() {
     assert!(
         pool.pick().is_none(),
         "pick() must return None once every carrier is gone"
+    );
+}
+
+// ── Capture E2E gate: real BT events on the wire ────────────────────────────
+
+/// Prove the live tunnel actually emits real BitTorrent protocol messages
+/// (BEP-10 extended handshake, bitfield, piece cover), not just opaque
+/// framing. The masquerade sits INSIDE the MSE/RC4-encrypted stream (exactly
+/// like a real encrypted BT peer), so a raw byte capture can't see BT
+/// messages — this taps at the MESSAGE layer instead, via the `#[cfg(test)]`
+/// thread-local `CarrierTrace` sink installed on `carrier_wire::write_message`
+/// (the single outgoing serialization choke point used by both the client and
+/// server carrier halves).
+///
+/// Mirrors `build_real_relay_pair` + `ClientMux::new` + the production
+/// `run_server_relay` from `real_relay_transfers_large_payload_with_flow_control`
+/// above (a real Noise-encrypted client/server pair) rather than the
+/// `TunnelFixture` echo harness: piece cover (`Request`/`Piece`) only flows
+/// through the cover-seed task wired into `ClientMux::new`, so the mux path is
+/// the one that actually exercises it.
+///
+/// MUST run on the current-thread runtime (`#[tokio::test]`, no
+/// `flavor = "multi_thread"`): the thread-local trace is only visible to tasks
+/// scheduled on this one thread, which is exactly how every relay/writer/
+/// reader task spawned by a current-thread runtime executes.
+#[tokio::test]
+async fn wire_shows_real_bittorrent_events() {
+    use crate::tunnel::carrier_wire::{clear_carrier_trace, install_carrier_trace};
+    use crate::tunnel::client_mux::{ClientMux, InboundTcp};
+    use crate::tunnel::egress::EgressPolicy;
+    use crate::tunnel::relay::run_server_relay;
+    use crate::tunnel::test_capture::CarrierEvent;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    crate::tests::test_util::setup_test_logging();
+
+    // Install the tap BEFORE any carrier handshake runs, so it observes the
+    // BEP-10 extended handshake + bitfield from `build_real_relay_pair` below.
+    let trace = install_carrier_trace();
+
+    // RAII guard: ensures the thread-local CARRIER_TRACE is always cleared,
+    // even if a `.expect`/`panic!`/timeout fires below before the happy-path
+    // cleanup is reached. Without this, a leftover trace can leak events into
+    // a later test scheduled on the same current-thread runtime worker.
+    struct ClearTraceGuard;
+    impl Drop for ClearTraceGuard {
+        fn drop(&mut self) {
+            clear_carrier_trace();
+        }
+    }
+    let _clear_trace_guard = ClearTraceGuard;
+
+    // Real loopback echo destination for a small SOCKS-style TCP round trip.
+    let echo = tokio::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+
+    let (client, peer) = build_real_relay_pair().await;
+    let token = CancellationToken::new();
+    let relay_token = token.clone();
+    tokio::spawn(async move {
+        run_server_relay(peer, Arc::new(EgressPolicy::default()), relay_token).await;
+    });
+
+    // `ClientMux::new` is where the minimal piece-cover seed task lives (Part
+    // A), so it MUST be on the path for Request/Piece traffic to appear.
+    let mux = ClientMux::new(client, token.clone());
+
+    let (stream_id, mut inbound, credit) = mux
+        .open_tcp(TunnelDestination::Ip(echo_addr))
+        .await
+        .expect("open_tcp");
+    match inbound.recv().await {
+        Some(InboundTcp::Opened(_)) => {}
+        _ => panic!("expected TcpOpened verdict, stream was not established"),
+    }
+
+    let payload = Bytes::from_static(b"capture-e2e");
+    assert!(
+        credit.reserve(payload.len()).await,
+        "credit pool closed before send"
+    );
+    assert!(
+        mux.send_tcp_data(stream_id, payload.clone()).await,
+        "send_tcp_data failed"
+    );
+    match inbound.recv().await {
+        Some(InboundTcp::Data(bytes)) => assert_eq!(&bytes[..], &payload[..]),
+        Some(InboundTcp::Opened(_)) => panic!("expected TcpData echo, got duplicate Opened"),
+        Some(InboundTcp::Fin) => panic!("expected TcpData echo, got Fin"),
+        Some(InboundTcp::Reset(code)) => panic!("expected TcpData echo, got Reset({code:?})"),
+        None => panic!("expected TcpData echo, got None (tunnel lost)"),
+    }
+
+    // The cover-seed task and both writers run as separate spawned tasks on
+    // this same current thread; poll (bounded) until their Request/Piece
+    // traffic has actually been written and observed by the tap.
+    crate::tests::test_util::wait_until(
+        || {
+            let events = trace.lock().events().to_vec();
+            if events.contains(&CarrierEvent::Request) || events.contains(&CarrierEvent::Piece) {
+                Ok(())
+            } else {
+                anyhow::bail!("no piece cover observed yet: {events:?}")
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("piece cover (Request/Piece) should appear on the wire");
+
+    let events = trace.lock().events().to_vec();
+    token.cancel();
+
+    assert!(
+        events.contains(&CarrierEvent::ExtendedHandshake),
+        "no BEP-10 extended handshake on wire: {events:?}"
+    );
+    assert!(
+        events.contains(&CarrierEvent::Bitfield),
+        "no bitfield on wire: {events:?}"
+    );
+    assert!(
+        events.contains(&CarrierEvent::Piece) || events.contains(&CarrierEvent::Request),
+        "no piece cover (Request/Piece) on wire: {events:?}"
     );
 }
