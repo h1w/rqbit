@@ -35,9 +35,9 @@ pub(crate) struct TunnelClientSupervisor {
     session_shutdown: CancellationToken,
     /// Deterministic synthetic carrier torrent shared with the server via the
     /// DHT rendezvous key (`descriptor().handshake_info_hash`). Built once by
-    /// the pool and shared across supervisors. Not yet consumed by
-    /// `TunnelClient::connect` / `ClientMux::new` — that lands in a later
-    /// task; today it is only used to derive the DHT discovery key below.
+    /// the pool and shared across supervisors. Passed into
+    /// [`TunnelClient::connect`] to present a real BitTorrent peer wire, and
+    /// used to derive the DHT discovery key below.
     carrier_store: Arc<TunnelCarrierStore>,
 }
 
@@ -203,6 +203,7 @@ impl TunnelClientSupervisor {
                     &opts.identity_key,
                     &opts.expected_server_key,
                     carrier_hash,
+                    self.carrier_store.clone(),
                 ),
             ) => r,
         };

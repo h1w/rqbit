@@ -21,19 +21,23 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
+use peer_binary_protocol::Message;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use super::carrier_peer::TunnelCarrierPeer;
+use super::carrier_wire::CarrierReadHalf;
 use super::client::TunnelClient;
 use super::config::{
-    OPEN_WINDOW, PACING_DEFAULT_RATE, PER_CONN_QUEUE, PING_INTERVAL, PING_NONCE_MAP_CAP,
+    OPEN_WINDOW, OUTBOUND_QUEUE, PACING_DEFAULT_RATE, PER_CONN_QUEUE, PING_INTERVAL,
+    PING_NONCE_MAP_CAP,
 };
 use super::crypto::NoiseTransport;
 use super::flow::{
     RttEstimator, SendCredit, WindowController, drive_flow_control, record_ping_sent,
 };
 use super::frame::{TunnelDestination, TunnelErrorCode, TunnelFrame};
-use super::relay::{FrameSink, read_encrypted_frame, spawn_frame_writer};
+use super::relay::{FrameSink, next_tunnel_frame, spawn_frame_writer};
 
 /// Inbound event routed to a single TCP stream handler.
 pub(crate) enum InboundTcp {
@@ -102,8 +106,11 @@ pub(crate) struct ClientMux {
 impl ClientMux {
     /// Split a connected client into shared transport + reader/writer tasks.
     pub(crate) fn new(client: TunnelClient, shutdown: CancellationToken) -> Arc<Self> {
-        let (transport, reader, writer) = client.into_split();
+        let (transport, read_half, write_half, carrier_peer) = client.into_carrier();
         let transport = Arc::new(Mutex::new(transport));
+        // Cover lane: the reader funnels inbound piece Request→Piece cover here
+        // and the writer task drains it (unpaced, below control priority).
+        let (cover_tx, cover_rx) = mpsc::channel::<Message<'static>>(OUTBOUND_QUEUE);
         // ONE pacing-rate cell shared by the writer (which re-reads it per
         // frame) and the control task below (which drives it to `target / rtt`).
         // Seeded at the effectively-unlimited default until the first RTT
@@ -116,7 +123,8 @@ impl ClientMux {
         let paced = Arc::new(AtomicBool::new(false));
         let (sink, _writer_handle) = spawn_frame_writer(
             transport.clone(),
-            writer,
+            write_half,
+            cover_rx,
             shutdown.clone(),
             pacing_rate.clone(),
             paced.clone(),
@@ -148,7 +156,9 @@ impl ClientMux {
 
         tokio::spawn(reader_loop(
             transport,
-            reader,
+            read_half,
+            carrier_peer,
+            cover_tx,
             tcp,
             udp,
             load,
@@ -379,10 +389,13 @@ async fn ping_and_control_task(
 }
 
 /// Central reader: decrypt inbound frames and route them to the owning handler.
+/// Serves inbound piece cover (Request→Piece) via `cover_tx` along the way.
 #[allow(clippy::too_many_arguments)]
 async fn reader_loop(
     transport: Arc<Mutex<NoiseTransport>>,
-    mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    mut read_half: CarrierReadHalf,
+    carrier_peer: TunnelCarrierPeer,
+    cover_tx: mpsc::Sender<Message<'static>>,
     tcp: TcpRoutes,
     udp: UdpRoutes,
     load: Arc<AtomicUsize>,
@@ -391,13 +404,29 @@ async fn reader_loop(
     sink: FrameSink,
     shutdown: CancellationToken,
 ) {
+    // Carrier read state (see `next_tunnel_frame`): the defragmenter reassembles
+    // chunked Noise ciphertext, `pending` buffers multiple blobs a single `push`
+    // can yield, and `carrier_peer` handles inbound piece cover.
+    let mut defrag = super::carrier_chunk::CarrierDefragmenter::new(
+        super::carrier_chunk::MAX_CARRIER_CIPHERTEXT,
+    );
+    let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+    let mut carrier_peer = carrier_peer;
+
     loop {
         let frame = tokio::select! {
             _ = shutdown.cancelled() => break,
-            r = read_encrypted_frame(&transport, &mut reader) => match r {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::debug!(error = %e, "tunnel client reader ended");
+            f = next_tunnel_frame(
+                &mut read_half,
+                &mut defrag,
+                &mut pending,
+                &transport,
+                &mut carrier_peer,
+                &cover_tx,
+            ) => match f {
+                Some(f) => f,
+                None => {
+                    tracing::debug!("tunnel client reader ended");
                     break;
                 }
             },
